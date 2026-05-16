@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-chatluna-image-resolver",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "ChatLuna image search resolver that extracts, downloads, stores, and optionally syncs images to WebDAV.",
   "repository": {
     "type": "git",
