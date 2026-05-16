@@ -1,15 +1,15 @@
 {
-  "name": "koishi-plugin-chatluna-image-resolver",
-  "version": "1.0.0",
-  "description": "ChatLuna image search resolver that extracts, downloads, stores, and optionally syncs images to WebDAV.",
+  "name": "koishi-plugin-miyako-chatluna-image-resolver",
+  "version": "1.1.0",
+  "description": "Miyako ChatLuna image resolver with keyword search, reverse image search, managed local cache, and optional WebDAV sync.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yabo083/koishi-plugin-chatluna-image-resolver.git"
+    "url": "git+https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver.git"
   },
   "bugs": {
-    "url": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver/issues"
+    "url": "https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver/issues"
   },
-  "homepage": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver#readme",
+  "homepage": "https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver#readme",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
@@ -27,7 +27,9 @@
     "chatluna",
     "image",
     "resolver",
-    "webdav"
+    "webdav",
+    "miyako",
+    "reverse-image-search"
   ],
   "author": "yabo",
   "license": "AGPL-3.0-only",
@@ -35,7 +37,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run build:server && npm run build:client",
+    "build:server": "tsc -p tsconfig.json",
+    "build:client": "koishi-console build .",
     "test": "npm run build && node --test tests/*.test.cjs",
     "prepublishOnly": "npm run build"
   },
@@ -53,18 +57,26 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@koishijs/client": "^5.30.11",
     "@types/node": "^22.7.5",
     "typescript": "^5.6.2"
   },
+  "yakumo": {
+    "client": "./client/index.ts"
+  },
   "koishi": {
+    "public": [
+      "dist"
+    ],
     "description": {
-      "zh": "ChatLuna 图片解析器：搜索图片、提取候选、下载转存为 Koishi 本地链接，并可同步到 WebDAV。"
+      "zh": "Miyako ChatLuna 图片解析器：搜图、以图搜图、统一缓存管理与 WebDAV 同步。"
     },
     "service": {
       "optional": [
         "chatluna",
         "chatluna_storage",
-        "puppeteer"
+        "puppeteer",
+        "console"
       ]
     }
   }

@@ -2,11 +2,11 @@ import { Context, h, Schema } from 'koishi'
 import { StructuredTool } from '@langchain/core/tools'
 import { z } from 'zod'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { extname, join } from 'node:path'
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
+import { extname, join, resolve } from 'node:path'
 
-export const name = 'chatluna-image-resolver'
-export const inject = { optional: ['chatluna', 'chatluna_storage', 'puppeteer', 'server'] as const }
+export const name = 'miyako-chatluna-image-resolver'
+export const inject = { optional: ['chatluna', 'chatluna_storage', 'puppeteer', 'server', 'console'] as const }
 
 export interface WebDavConfig {
   enabled: boolean
@@ -44,10 +44,24 @@ export interface Config {
     tempExpireHours: number
     userAgent: string
   }
+  reverse: {
+    enabled: boolean
+    toolName: string
+    description: string
+    provider: 'serpapi' | 'google'
+    serpApiKey: string
+    serpApiGoogleDomain: string
+    googleApiKey: string
+    maxResults: number
+    publicBaseUrl: string
+    customPrompt: string
+  }
   storage: {
     localFallback: boolean
     localDirectory: string
     localPublicPath: string
+    retentionDays: number
+    cleanupIntervalHours: number
   }
   delivery: {
     publicBaseUrl: string
@@ -82,10 +96,47 @@ interface StoredImage {
   mime: string
 }
 
+interface WebDetection {
+  webEntities?: Array<{ entityId?: string; score?: number; description?: string }>
+  fullMatchingImages?: Array<{ url?: string }>
+  partialMatchingImages?: Array<{ url?: string }>
+  pagesWithMatchingImages?: Array<{ url?: string; pageTitle?: string }>
+  visuallySimilarImages?: Array<{ url?: string }>
+  bestGuessLabels?: Array<{ label?: string; languageCode?: string }>
+}
+
+interface GoogleReverseResult {
+  provider: 'google'
+  imageUrl: string
+  webDetection: WebDetection
+  note?: string
+}
+
+interface SerpApiReverseResult {
+  provider: 'serpapi'
+  imageUrl: string
+  searchInformation?: unknown
+  imageResults: Array<{
+    position?: number
+    title?: string
+    link?: string
+    source?: string
+    thumbnail?: string
+    original?: string
+  }>
+  note?: string
+}
+
 const TOOL_SCHEMA = z.object({
   query: z.string().min(1).describe('Image search query, for example "天童爱丽丝 普通图片" or "Tendou Aris fanart".'),
   count: z.number().int().min(1).max(8).optional().describe('Number of images to resolve. Defaults to 1.'),
   safeMode: z.boolean().optional().describe('Use conservative filtering for icons, logos, tiny images, and risky pages. Defaults to true.')
+})
+
+const REVERSE_TOOL_SCHEMA = z.object({
+  imageUrl: z.string().url().describe('Image URL to reverse search. Google downloads it and sends base64 bytes; SerpApi requires a public URL.'),
+  provider: z.enum(['serpapi', 'google']).optional().describe('Override the configured reverse-search provider for this call.'),
+  maxResults: z.number().int().min(1).max(50).optional().describe('Maximum reverse-search results. Defaults to the plugin config.')
 })
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -126,15 +177,34 @@ export const Config: Schema<Config> = Schema.intersect([
       maxDownloadBytes: Schema.number().min(100000).max(20000000).default(8000000).description('单张图片最大下载字节数。'),
       minWidth: Schema.number().min(1).max(4000).default(220).description('候选图片最小宽度。'),
       minHeight: Schema.number().min(1).max(4000).default(220).description('候选图片最小高度。'),
-      tempExpireHours: Schema.number().min(1).max(24 * 365).default(24 * 30).description('转存到 ChatLuna Storage 的过期小时数。'),
+      tempExpireHours: Schema.number().min(1).max(24 * 365).default(24 * 7).description('转存到 ChatLuna Storage 的过期小时数。默认 7 天。'),
       userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36').description('下载图片时使用的 User-Agent。')
     }).description('图片')
+  }),
+  Schema.object({
+    reverse: Schema.object({
+      enabled: Schema.boolean().default(true).description('是否注册以图搜图 ChatLuna 工具。'),
+      toolName: Schema.string().default('image_reverse_search_resolve').description('以图搜图工具名称。'),
+      description: Schema.string().role('textarea').default('Reverse-searches an image with SerpApi Google Reverse Image or Google Vision Web Detection. Use Google when the image is in ChatLuna cache or any fetchable URL because this plugin sends base64 image bytes; use SerpApi only when the image URL is publicly reachable.').description('以图搜图工具描述。'),
+      provider: Schema.union([
+        Schema.const('serpapi').description('SerpApi Google Reverse Image API，使用 image_url。'),
+        Schema.const('google').description('Google Cloud Vision Web Detection，插件会下载图片并转为 base64。')
+      ]).default('serpapi').description('以图搜图提供方。'),
+      serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key；留空则复用搜索配置中的 SerpApi Key。'),
+      serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain。'),
+      googleApiKey: Schema.string().role('secret').default('').description('Google Cloud Vision API Key。'),
+      maxResults: Schema.number().min(1).max(50).default(10).description('最大反搜结果数。'),
+      publicBaseUrl: Schema.string().default('').description('公网 Koishi 根地址；SerpApi 需要公网 URL 时用于改写 ChatLuna/本地缓存链接。'),
+      customPrompt: Schema.string().role('textarea').default('').description('附加到以图搜图工具结果中的模型提示。')
+    }).description('以图搜图')
   }),
   Schema.object({
     storage: Schema.object({
       localFallback: Schema.boolean().default(true).description('没有 chatluna-storage-service 时，是否使用插件本地目录和 HTTP 路由兜底。'),
       localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
-      localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。')
+      localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。'),
+      retentionDays: Schema.number().min(1).max(365).default(7).description('统一图片缓存保留天数。'),
+      cleanupIntervalHours: Schema.number().min(1).max(24 * 30).default(24).description('统一图片缓存清理间隔小时数。')
     }).description('本地转存')
   }),
   Schema.object({
@@ -156,15 +226,18 @@ export const Config: Schema<Config> = Schema.intersect([
 ])
 
 export const usage = `
-<p><strong>ChatLuna 图片解析器</strong></p>
-<p>注册 <code>image_search_resolve</code> 工具，用于搜索图片、提取候选图片、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
-<p>建议让角色预设在图片请求中优先调用该工具，再把返回的 <code>images[].url</code> 放进 <code>character_reply.image</code>。</p>
+<p><strong>Miyako ChatLuna 图片解析器</strong></p>
+<p>注册 <code>image_search_resolve</code> 和 <code>image_reverse_search_resolve</code> 工具，用于搜图、以图搜图、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
+<p>本地缓存默认保留 7 天。启用 console 后，可在插件详情页查看缓存图片并检测原始直链存活状态。</p>
 `
 
 declare module 'koishi' {
   interface Context {
     chatluna?: any
     chatluna_storage?: {
+      config?: {
+        serverPath?: string
+      }
       createTempFile: (buffer: Buffer, filename: string, expireHours?: number, mimeType?: string) => Promise<{ url: string }>
     }
     puppeteer?: {
@@ -173,6 +246,10 @@ declare module 'koishi' {
     server?: {
       selfUrl?: string
       get: (path: string, handler: (koa: any) => Promise<void> | void) => void
+      post?: (path: string, handler: (koa: any) => Promise<void> | void) => void
+    }
+    console?: {
+      addEntry: (entry: { dev: string; prod: string }) => void
     }
   }
 }
@@ -193,6 +270,24 @@ class ImageResolverTool extends StructuredTool {
     const safeMode = input.safeMode ?? true
     const resolver = new ImageResolver(this.ctx, this.config)
     const result = await resolver.resolve(input.query, count, safeMode)
+    return JSON.stringify(result, null, 2)
+  }
+}
+
+class ReverseImageResolverTool extends StructuredTool {
+  name: string
+  description: string
+  schema: any = REVERSE_TOOL_SCHEMA
+
+  constructor(private ctx: Context, private config: Config) {
+    super({})
+    this.name = config.reverse.toolName.trim() || 'image_reverse_search_resolve'
+    this.description = config.reverse.description.trim()
+  }
+
+  async _call(input: z.infer<typeof REVERSE_TOOL_SCHEMA>) {
+    const resolver = new ReverseImageResolver(this.ctx, this.config)
+    const result = await resolver.resolve(input.imageUrl, input.provider, input.maxResults)
     return JSON.stringify(result, null, 2)
   }
 }
@@ -233,7 +328,7 @@ class ImageResolver {
       try {
         const downloaded = await this.download(candidate)
         if (!downloaded) continue
-        const stored = await this.store(downloaded.buffer, downloaded.filename, downloaded.mime)
+        const stored = await this.store(downloaded.buffer, downloaded.filename, downloaded.mime, candidate)
         const webdavUrl = await this.syncWebDav(downloaded.buffer, downloaded.filename, downloaded.mime, failures)
         images.push({
           url: stored,
@@ -439,19 +534,15 @@ class ImageResolver {
     return { buffer, mime, filename: `resolved-${hash}${ext}` }
   }
 
-  private async store(buffer: Buffer, filename: string, mime: string) {
-    if (this.ctx.chatluna_storage?.createTempFile) {
-      const stored = await this.ctx.chatluna_storage.createTempFile(buffer, filename, this.config.image.tempExpireHours, mime)
-      return rewriteUrlBase(stored.url, this.config.delivery.publicBaseUrl)
-    }
-    if (!this.config.storage.localFallback) {
-      throw new Error('chatluna-storage-service is not available and local fallback is disabled')
-    }
-    const dir = join(this.ctx.baseDir, this.config.storage.localDirectory)
-    await mkdir(dir, { recursive: true })
-    await writeFile(join(dir, filename), buffer)
-    const base = trimTrailingSlash(this.ctx.server?.selfUrl ?? '')
-    return rewriteUrlBase(`${base}${this.config.storage.localPublicPath}/${filename}`, this.config.delivery.publicBaseUrl)
+  private async store(buffer: Buffer, filename: string, mime: string, candidate?: ImageCandidate) {
+    return storeManagedImage(this.ctx, this.config, buffer, filename, mime, candidate ? {
+      kind: 'keyword-search',
+      originalUrl: candidate.url,
+      sourcePage: candidate.sourcePage,
+      width: candidate.width,
+      height: candidate.height,
+      reason: candidate.reason
+    } : undefined)
   }
 
   private async syncWebDav(buffer: Buffer, filename: string, mime: string, failures: string[]) {
@@ -482,10 +573,123 @@ class ImageResolver {
   }
 }
 
+class ReverseImageResolver {
+  constructor(private ctx: Context, private config: Config) {}
+
+  async resolve(imageUrl: string, providerOverride?: 'serpapi' | 'google', maxResultsOverride?: number) {
+    const provider = providerOverride ?? this.config.reverse.provider
+    const maxResults = clamp(maxResultsOverride ?? this.config.reverse.maxResults, 1, 50)
+    try {
+      const result = provider === 'google'
+        ? await this.callGoogleVision(imageUrl, maxResults)
+        : await this.callSerpApi(imageUrl, maxResults)
+      return attachReverseNote(result, this.config)
+    } catch (error) {
+      return {
+        ok: false,
+        provider,
+        imageUrl,
+        error: formatError(error),
+        hint: provider === 'google'
+          ? 'Google provider downloads the image and sends base64 bytes to Google Cloud Vision Web Detection.'
+          : 'URL-based reverse image providers require a public image URL. Use reverse.publicBaseUrl to rewrite ChatLuna cached local URLs before calling them.'
+      }
+    }
+  }
+
+  private async callSerpApi(imageUrl: string, maxResults: number): Promise<SerpApiReverseResult> {
+    const apiKey = (this.config.reverse.serpApiKey || this.config.search.serpApiKey).trim()
+    if (!apiKey) throw new Error('missing SerpApi API key')
+    const publicImageUrl = rewriteImageUrlForPublicAccess(
+      imageUrl,
+      this.ctx.chatluna_storage?.config?.serverPath || this.ctx.server?.selfUrl || '',
+      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
+    )
+    if (!isPublicHttpUrl(publicImageUrl)) {
+      throw new Error('SerpApi reverse image requires a public image URL; the current URL looks private or local')
+    }
+    const response = await fetchWithTimeout(buildSerpApiReverseImageUrl({
+      apiKey,
+      imageUrl: publicImageUrl,
+      googleDomain: this.config.reverse.serpApiGoogleDomain || this.config.search.serpApiGoogleDomain
+    }), {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': this.config.image.userAgent
+      }
+    }, this.config.search.pageTimeoutMs)
+    const payload: any = await response.json()
+    if (!response.ok) throw new Error(payload?.error || `SerpApi HTTP ${response.status}`)
+    if (payload?.error) throw new Error(String(payload.error))
+    return serpApiReversePayloadToResult(imageUrl, payload, maxResults)
+  }
+
+  private async callGoogleVision(imageUrl: string, maxResults: number): Promise<GoogleReverseResult> {
+    const apiKey = this.config.reverse.googleApiKey.trim()
+    if (!apiKey) throw new Error('missing Google Vision API key')
+    const imageResponse = await fetchWithTimeout(imageUrl, {
+      headers: {
+        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'User-Agent': this.config.image.userAgent
+      }
+    }, this.config.search.pageTimeoutMs)
+    if (!imageResponse.ok) throw new Error(`fetch image failed: HTTP ${imageResponse.status}`)
+    const mime = (imageResponse.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+    if (mime && !mime.startsWith('image/')) throw new Error(`fetch image failed: not image (${mime})`)
+    const buffer = Buffer.from(await imageResponse.arrayBuffer())
+    if (buffer.length > this.config.image.maxDownloadBytes) throw new Error(`image too large: ${buffer.length}`)
+
+    const apiResponse = await fetchWithTimeout(
+      `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'User-Agent': this.config.image.userAgent
+        },
+        body: JSON.stringify(buildGoogleVisionWebDetectionRequest(buffer, maxResults))
+      },
+      this.config.search.pageTimeoutMs
+    )
+    const payload: any = await apiResponse.json()
+    if (!apiResponse.ok) throw new Error(payload?.error?.message || `Google Vision HTTP ${apiResponse.status}`)
+    const first = payload?.responses?.[0]
+    if (first?.error?.message) throw new Error(first.error.message)
+    const web = first?.webDetection
+    if (!web) throw new Error('Google Vision did not return webDetection')
+    return {
+      provider: 'google',
+      imageUrl,
+      webDetection: normalizeWebDetection(web, maxResults)
+    }
+  }
+
+}
+
 export function apply(ctx: Context, config: Config) {
+  ctx.console?.addEntry({
+    dev: resolve(__dirname, '../client/index.ts'),
+    prod: resolve(__dirname, '../dist')
+  })
+
   if (config.storage.localFallback) {
     ctx.inject(['server'], (ctx2) => {
       if (!ctx2.server) return
+      ctx2.server.get(`${config.storage.localPublicPath}/_cache`, async (koa) => {
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify(await listManagedImageCache(join(ctx.baseDir, config.storage.localDirectory)))
+      })
+      ctx2.server.get(`${config.storage.localPublicPath}/_cache/check`, async (koa) => {
+        const url = String(koa.query?.url ?? '').trim()
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify(await checkRemoteImageAlive(url, config))
+      })
+      ctx2.server.post?.(`${config.storage.localPublicPath}/_cache/check`, async (koa) => {
+        const body = await readJsonBody(koa)
+        const url = String(body?.url ?? '').trim()
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify(await checkRemoteImageAlive(url, config))
+      })
       ctx2.server.get(`${config.storage.localPublicPath}/:name`, async (koa) => {
         const filename = String(koa.params.name ?? '')
         if (!/^[a-zA-Z0-9._-]+$/.test(filename)) {
@@ -501,6 +705,16 @@ export function apply(ctx: Context, config: Config) {
         }
       })
     })
+    ctx.on('ready', () => {
+      void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
+        retentionDays: config.storage.retentionDays
+      }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
+    })
+    ctx.setInterval?.(() => {
+      void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
+        retentionDays: config.storage.retentionDays
+      }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
+    }, Math.max(1, config.storage.cleanupIntervalHours) * 60 * 60 * 1000)
   }
 
   const registerTool = (ctx2: Context) => {
@@ -531,6 +745,31 @@ export function apply(ctx: Context, config: Config) {
       }
     }))
     ctx2.logger(name).info('registered ChatLuna tool: %s', toolName)
+
+    if (config.reverse.enabled) {
+      const reverseToolName = config.reverse.toolName.trim() || 'image_reverse_search_resolve'
+      ctx2.effect(() => ctx2.chatluna.platform.registerTool(reverseToolName, {
+        description: config.reverse.description,
+        selector() {
+          return true
+        },
+        createTool() {
+          return new ReverseImageResolverTool(ctx2, config)
+        },
+        meta: {
+          source: 'extension',
+          group: 'image-resolver',
+          tags: ['image-resolver', 'reverse-image-search', 'google-lens', config.reverse.provider],
+          defaultAvailability: {
+            enabled: true,
+            main: true,
+            chatluna: true,
+            characterScope: 'all'
+          }
+        }
+      }))
+      ctx2.logger(name).info('registered ChatLuna reverse image tool: %s', reverseToolName)
+    }
   }
 
   ctx.inject(['chatluna'], registerTool)
@@ -554,6 +793,18 @@ export function apply(ctx: Context, config: Config) {
       return `已转存 ${result.images.length} 张图片。`
     }
     )
+
+  ctx.command('image-resolver.reverse <imageUrl:string>', '以图搜图并返回来源线索')
+    .option('provider', '-p <provider:string> 指定 serpapi 或 google')
+    .option('maxResults', '-m <maxResults:number> 最大返回结果数')
+    .action(async ({ options }, imageUrl) => {
+      if (!imageUrl?.trim()) return '请输入图片 URL。'
+      const provider = options?.provider === 'google' || options?.provider === 'serpapi'
+        ? options.provider
+        : undefined
+      const resolver = new ReverseImageResolver(ctx, config)
+      return JSON.stringify(await resolver.resolve(imageUrl, provider, Number(options?.maxResults) || undefined), null, 2)
+    })
 }
 
 function extractImageCandidates(html: string, pageUrl: string): ImageCandidate[] {
@@ -638,11 +889,275 @@ export function serpApiImagesToCandidates(payload: any): ImageCandidate[] {
   return uniqueBy(candidates, (item) => normalizeImageUrl(item.url))
 }
 
+export function buildGoogleVisionWebDetectionRequest(buffer: Buffer, maxResults: number) {
+  return {
+    requests: [
+      {
+        image: {
+          content: buffer.toString('base64')
+        },
+        features: [
+          {
+            type: 'WEB_DETECTION',
+            maxResults: clamp(Math.floor(maxResults), 1, 50)
+          }
+        ]
+      }
+    ]
+  }
+}
+
+export function buildSerpApiReverseImageUrl(options: {
+  apiKey: string
+  imageUrl: string
+  googleDomain?: string
+}) {
+  const url = new URL('https://serpapi.com/search.json')
+  url.searchParams.set('engine', 'google_reverse_image')
+  url.searchParams.set('api_key', options.apiKey)
+  url.searchParams.set('image_url', options.imageUrl)
+  if (options.googleDomain?.trim()) url.searchParams.set('google_domain', options.googleDomain.trim())
+  return url.href
+}
+
+export function serpApiReversePayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiReverseResult {
+  const raw = Array.isArray(payload?.image_results) ? payload.image_results : []
+  return {
+    provider: 'serpapi',
+    imageUrl,
+    searchInformation: payload?.search_information,
+    imageResults: raw.slice(0, maxResults).map((item: any) => ({
+      position: numberOrUndefined(item?.position),
+      title: typeof item?.title === 'string' ? item.title : '',
+      link: typeof item?.link === 'string' ? item.link : '',
+      source: typeof item?.source === 'string' ? item.source : '',
+      thumbnail: typeof item?.thumbnail === 'string' ? item.thumbnail : '',
+      original: typeof item?.original === 'string' ? item.original : ''
+    }))
+  }
+}
+
+export function isPublicHttpUrl(url: string) {
+  try {
+    const parsed = new URL(url)
+    if (!/^https?:$/i.test(parsed.protocol)) return false
+    const host = parsed.hostname.toLowerCase()
+    if (!host || host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0' || host === 'koishi') return false
+    if (host.endsWith('.local') || !host.includes('.')) return false
+    if (isPrivateIPv4(host)) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+export function rewriteImageUrlForPublicAccess(imageUrl: string, privateBaseUrl: string, publicBaseUrl: string) {
+  const privateBase = trimTrailingSlash(privateBaseUrl.trim())
+  const publicBase = trimTrailingSlash(publicBaseUrl.trim())
+  if (!privateBase || !publicBase) return imageUrl
+  if (!imageUrl.startsWith(privateBase)) return imageUrl
+  return `${publicBase}${imageUrl.slice(privateBase.length)}`
+}
+
+export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; now?: number }) {
+  const now = options.now ?? Date.now()
+  const cutoff = now - Math.max(1, options.retentionDays) * 24 * 60 * 60 * 1000
+  let deleted = 0
+  let scanned = 0
+  let skipped = 0
+  let entries: string[] = []
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return { scanned, deleted, skipped }
+  }
+  for (const entry of entries) {
+    if (!isManagedCacheFilename(entry)) {
+      skipped++
+      continue
+    }
+    scanned++
+    const file = join(directory, entry)
+    try {
+      const info = await stat(file)
+      if (!info.isFile() || info.mtimeMs > cutoff) continue
+      await unlink(file)
+      deleted++
+    } catch {
+      skipped++
+    }
+  }
+  return { scanned, deleted, skipped }
+}
+
+export async function listManagedImageCache(directory: string) {
+  let entries: string[] = []
+  try {
+    entries = await readdir(directory)
+  } catch {
+    return { items: [] }
+  }
+  const items: any[] = []
+  for (const entry of entries.filter((item) => item.endsWith('.json')).sort()) {
+    if (!isManagedCacheFilename(entry)) continue
+    try {
+      const file = join(directory, entry)
+      const info = await stat(file)
+      const manifest = JSON.parse(await readFile(file, 'utf8'))
+      items.push({
+        ...manifest,
+        manifest: entry,
+        mtime: info.mtime.toISOString()
+      })
+    } catch {
+      // Ignore corrupt manifests; cleanup can remove them later when expired.
+    }
+  }
+  return { items }
+}
+
+export async function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>) {
+  if (!/^https?:\/\//i.test(url)) {
+    return { ok: false, status: 0, error: 'missing or invalid http url' }
+  }
+  const headers = {
+    'User-Agent': config.image.userAgent,
+    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+  }
+  try {
+    const head = await fetchWithTimeout(url, { method: 'HEAD', headers }, config.search.pageTimeoutMs)
+    if (head.ok) {
+      return {
+        ok: true,
+        status: head.status,
+        contentType: head.headers.get('content-type') || '',
+        contentLength: head.headers.get('content-length') || ''
+      }
+    }
+    if (![403, 405].includes(head.status)) {
+      return { ok: false, status: head.status, contentType: head.headers.get('content-type') || '' }
+    }
+  } catch {
+    // Fall back to a ranged GET below.
+  }
+  try {
+    const get = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: {
+        ...headers,
+        'Range': 'bytes=0-0'
+      }
+    }, config.search.pageTimeoutMs)
+    return {
+      ok: get.ok || get.status === 206,
+      status: get.status,
+      contentType: get.headers.get('content-type') || '',
+      contentLength: get.headers.get('content-length') || ''
+    }
+  } catch (error) {
+    return { ok: false, status: 0, error: formatError(error) }
+  }
+}
+
 function bestSourcePage(item: any) {
   for (const value of [item?.link, item?.source, item?.original]) {
     if (typeof value === 'string' && /^https?:\/\//i.test(value)) return value
   }
   return 'https://serpapi.com/'
+}
+
+function normalizeWebDetection(web: WebDetection, maxResults: number): WebDetection {
+  return {
+    webEntities: (web.webEntities ?? []).slice(0, maxResults).map((item) => ({
+      score: item.score,
+      description: item.description
+    })),
+    fullMatchingImages: [],
+    partialMatchingImages: [],
+    pagesWithMatchingImages: (web.pagesWithMatchingImages ?? [])
+      .filter((item) => item.url)
+      .slice(0, maxResults)
+      .map((item) => ({
+        url: item.url,
+        pageTitle: item.pageTitle || ''
+      })),
+    visuallySimilarImages: [],
+    bestGuessLabels: (web.bestGuessLabels ?? []).slice(0, maxResults)
+  }
+}
+
+function attachReverseNote<T extends GoogleReverseResult | SerpApiReverseResult>(result: T, config: Config): T & { ok: true; note: string } {
+  const notes = [
+    result.provider === 'google'
+      ? 'Google provider used downloaded image bytes encoded as base64, so ChatLuna cached/local image URLs are acceptable if Koishi can fetch them.'
+      : 'SerpApi provider used Google Reverse Image with image_url, so imageUrl must be publicly reachable by SerpApi/Google.'
+  ]
+  if (config.reverse.customPrompt.trim()) notes.push(config.reverse.customPrompt.trim())
+  return {
+    ...result,
+    ok: true,
+    note: notes.join('\n\n')
+  }
+}
+
+async function storeManagedImage(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: Record<string, unknown> = {}) {
+  if (ctx.chatluna_storage?.createTempFile) {
+    const stored = await ctx.chatluna_storage.createTempFile(buffer, filename, config.image.tempExpireHours, mime)
+    return rewriteUrlBase(stored.url, config.delivery.publicBaseUrl)
+  }
+  if (!config.storage.localFallback) {
+    throw new Error('chatluna-storage-service is not available and local fallback is disabled')
+  }
+  const dir = join(ctx.baseDir, config.storage.localDirectory)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, filename), buffer)
+  const base = trimTrailingSlash(ctx.server?.selfUrl ?? '')
+  const publicUrl = rewriteUrlBase(`${base}${config.storage.localPublicPath}/${filename}`, config.delivery.publicBaseUrl)
+  await writeFile(join(dir, `${filename}.json`), JSON.stringify({
+    filename,
+    url: publicUrl,
+    mime,
+    bytes: buffer.length,
+    createdAt: new Date().toISOString(),
+    retentionDays: config.storage.retentionDays,
+    ...metadata
+  }, null, 2))
+  return publicUrl
+}
+
+function isManagedCacheFilename(filename: string) {
+  return /^resolved-[a-zA-Z0-9._-]+\.(?:jpe?g|png|webp|gif|avif)(?:\.json)?$/i.test(filename)
+    || /^resolved-[a-zA-Z0-9._-]+\.json$/i.test(filename)
+}
+
+async function readJsonBody(koa: any) {
+  if (koa.request?.body) return koa.request.body
+  const req = koa.req
+  if (!req) return {}
+  const chunks: Buffer[] = []
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  }
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return {}
+  }
+}
+
+function isPrivateIPv4(host: string) {
+  const match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (!match) return false
+  const parts = match.slice(1).map((item) => Number(item))
+  if (parts.some((item) => !Number.isInteger(item) || item < 0 || item > 255)) return false
+  const [a, b] = parts
+  if (a === 10 || a === 127) return true
+  if (a === 192 && b === 168) return true
+  if (a === 172 && b >= 16 && b <= 31) return true
+  if (a === 169 && b === 254) return true
+  return false
 }
 
 function numberOrUndefined(value: unknown) {
