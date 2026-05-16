@@ -1,0 +1,71 @@
+{
+  "name": "koishi-plugin-chatluna-image-resolver",
+  "version": "0.1.0",
+  "description": "ChatLuna image search resolver that extracts, downloads, stores, and optionally syncs images to WebDAV.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yabo083/koishi-plugin-chatluna-image-resolver.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver/issues"
+  },
+  "homepage": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver#readme",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "chatluna",
+    "image",
+    "resolver",
+    "webdav"
+  ],
+  "author": "yabo",
+  "license": "AGPL-3.0-only",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.cjs",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.0",
+    "koishi-plugin-chatluna-character": "*"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-chatluna-character": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "typescript": "^5.6.2"
+  },
+  "koishi": {
+    "description": {
+      "zh": "ChatLuna 图片解析器：搜索图片、提取候选、下载转存为 Koishi 本地链接，并可同步到 WebDAV。"
+    },
+    "service": {
+      "optional": [
+        "chatluna",
+        "chatluna_storage",
+        "puppeteer"
+      ]
+    }
+  }
+}
