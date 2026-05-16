@@ -56,6 +56,13 @@ export interface Config {
     publicBaseUrl: string
     customPrompt: string
   }
+  qqImage: {
+    enabled: boolean
+    toolName: string
+    description: string
+    maxTrackedMessages: number
+    cacheOnResolve: boolean
+  }
   storage: {
     localFallback: boolean
     localDirectory: string
@@ -94,6 +101,20 @@ interface StoredImage {
   height?: number
   bytes: number
   mime: string
+}
+
+interface QQImageRecord {
+  messageId: string
+  channelId: string
+  guildId: string
+  userId: string
+  timestamp: number
+  images: Array<{
+    src: string
+    file?: string
+    fileSize?: number
+    attrs: Record<string, unknown>
+  }>
 }
 
 interface WebDetection {
@@ -137,6 +158,13 @@ const REVERSE_TOOL_SCHEMA = z.object({
   imageUrl: z.string().url().describe('Image URL to reverse search. Google downloads it and sends base64 bytes; SerpApi requires a public URL.'),
   provider: z.enum(['serpapi', 'google']).optional().describe('Override the configured reverse-search provider for this call.'),
   maxResults: z.number().int().min(1).max(50).optional().describe('Maximum reverse-search results. Defaults to the plugin config.')
+})
+
+const QQ_IMAGE_TOOL_SCHEMA = z.object({
+  messageId: z.string().optional().describe('QQ/OneBot message id that contains an image. If omitted, the latest tracked image message is used.'),
+  imageIndex: z.number().int().min(0).optional().describe('Zero-based image index in the message. Defaults to the last image.'),
+  cache: z.boolean().optional().describe('Download and store the image in the managed 7-day cache. Defaults to plugin config.'),
+  target: z.enum(['auto', 'serpapi', 'google', 'chatluna']).optional().describe('Consumer that needs the image URL. Defaults to auto.')
 })
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -199,6 +227,15 @@ export const Config: Schema<Config> = Schema.intersect([
     }).description('以图搜图')
   }),
   Schema.object({
+    qqImage: Schema.object({
+      enabled: Schema.boolean().default(true).description('是否注册 QQ 图片直链解析工具。'),
+      toolName: Schema.string().default('qq_image_link_resolve').description('QQ 图片直链解析 ChatLuna 工具名称。'),
+      description: Schema.string().role('textarea').default('Resolves the original OneBot/NapCat QQ image URL from a recent QQ image message, verifies whether it is fetchable/public, and only then optionally stores it in the managed 7-day cache. Use this before reverse-searching or reading a QQ group image.').description('工具描述。'),
+      maxTrackedMessages: Schema.number().min(10).max(1000).default(120).description('仅在内存中保留最近多少条含图消息索引，不写入磁盘。'),
+      cacheOnResolve: Schema.boolean().default(true).description('工具被调用时是否按需下载并写入统一缓存。')
+    }).description('QQ 图片直链')
+  }),
+  Schema.object({
     storage: Schema.object({
       localFallback: Schema.boolean().default(true).description('没有 chatluna-storage-service 时，是否使用插件本地目录和 HTTP 路由兜底。'),
       localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
@@ -227,7 +264,7 @@ export const Config: Schema<Config> = Schema.intersect([
 
 export const usage = `
 <p><strong>Miyako ChatLuna 图片解析器</strong></p>
-<p>注册 <code>image_search_resolve</code> 和 <code>image_reverse_search_resolve</code> 工具，用于搜图、以图搜图、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
+<p>注册 <code>image_search_resolve</code>、<code>image_reverse_search_resolve</code> 和 <code>qq_image_link_resolve</code> 工具，用于搜图、以图搜图、按需解析 QQ 群图片直链、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
 <p>本地缓存默认保留 7 天。启用 console 后，可在插件详情页查看缓存图片并检测原始直链存活状态。</p>
 `
 
@@ -289,6 +326,149 @@ class ReverseImageResolverTool extends StructuredTool {
     const resolver = new ReverseImageResolver(this.ctx, this.config)
     const result = await resolver.resolve(input.imageUrl, input.provider, input.maxResults)
     return JSON.stringify(result, null, 2)
+  }
+}
+
+class QQImageLinkResolverTool extends StructuredTool {
+  name: string
+  description: string
+  schema: any = QQ_IMAGE_TOOL_SCHEMA
+
+  constructor(private ctx: Context, private config: Config, private tracker: QQImageTracker) {
+    super({})
+    this.name = config.qqImage.toolName.trim() || 'qq_image_link_resolve'
+    this.description = config.qqImage.description.trim()
+  }
+
+  async _call(input: z.infer<typeof QQ_IMAGE_TOOL_SCHEMA>) {
+    const record = this.tracker.find(input.messageId)
+    if (!record) {
+      return JSON.stringify({
+        ok: false,
+        error: input.messageId
+          ? `No tracked QQ image message found for messageId ${input.messageId}.`
+          : 'No recent QQ image message is tracked.',
+        hint: 'Ask the user to resend the QQ image, then call this tool with the image messageId from ChatLuna context.'
+      }, null, 2)
+    }
+
+    const imageIndex = clamp(input.imageIndex ?? record.images.length - 1, 0, record.images.length - 1)
+    const image = record.images[imageIndex]
+    const originalUrl = image.src
+    const alive = await checkRemoteImageAlive(originalUrl, this.config)
+    const publicUrl = isPublicHttpUrl(originalUrl)
+    const shouldCache = input.cache ?? this.config.qqImage.cacheOnResolve
+    const target = input.target ?? 'auto'
+    let cachedUrl: string | undefined
+    let cacheError: string | undefined
+    let bytes = 0
+    let mime = ''
+
+    if (shouldCache) {
+      try {
+        const downloaded = await downloadImageFromUrl(originalUrl, this.config, {
+          referer: 'https://multimedia.nt.qq.com.cn/'
+        })
+        bytes = downloaded.buffer.length
+        mime = downloaded.mime
+        cachedUrl = await storeManagedImage(this.ctx, this.config, downloaded.buffer, downloaded.filename, downloaded.mime, {
+          kind: 'qq-image',
+          originalUrl,
+          sourcePage: `onebot-message:${record.messageId}`,
+          messageId: record.messageId,
+          channelId: record.channelId,
+          guildId: record.guildId,
+          userId: record.userId,
+          imageIndex,
+          file: image.file,
+          fileSize: image.fileSize
+        })
+      } catch (error) {
+        cacheError = formatError(error)
+      }
+    }
+
+    return JSON.stringify({
+      ok: true,
+      target,
+      messageId: record.messageId,
+      imageIndex,
+      originalUrl,
+      cachedUrl,
+      originalUrlPublic: publicUrl,
+      originalUrlAlive: alive,
+      cached: Boolean(cachedUrl),
+      cacheError,
+      bytes: bytes || image.fileSize || undefined,
+      mime: mime || alive.contentType || undefined,
+      recommendations: {
+        serpapi: publicUrl && alive.ok
+          ? 'Use originalUrl for URL-based SerpApi engines. If google_reverse_image returns no results, try a Lens-capable flow or Google Vision/base64.'
+          : 'Do not use this URL for SerpApi because it is not a confirmed public, fetchable HTTP image URL.',
+        googleVision: cachedUrl
+          ? 'Use cachedUrl or originalUrl; the plugin can download bytes and submit base64 to Google Vision.'
+          : 'Use originalUrl if Koishi can fetch it; cache failed or was disabled.',
+        chatluna: cachedUrl
+          ? 'Use cachedUrl for local delivery and later cache inspection.'
+          : 'Use originalUrl only if the downstream consumer can fetch Tencent CDN URLs directly.'
+      },
+      note: 'QQ/NapCat image URLs often reject HEAD but allow ranged/full GET. This tool verifies with GET fallback and only writes the managed cache when called.'
+    }, null, 2)
+  }
+}
+
+class QQImageTracker {
+  private records: QQImageRecord[] = []
+  private byMessageId = new Map<string, QQImageRecord>()
+
+  constructor(private config: Config) {}
+
+  remember(session: any) {
+    const messageId = String(session?.messageId || session?.event?.message?.id || session?.event?.message?.messageId || '').trim()
+    if (!messageId) return
+    const elements = session?.event?.message?.elements || session?.elements || []
+    const images = elements
+      .filter((element: any) => element?.type === 'img' || element?.type === 'image')
+      .map((element: any) => {
+        const attrs = element.attrs || {}
+        const src = String(attrs.src || attrs.url || attrs.file || '').trim()
+        if (!src) return undefined
+        return {
+          src,
+          file: typeof attrs.file === 'string' ? attrs.file : undefined,
+          fileSize: numberOrUndefined(attrs.file_size ?? attrs.fileSize),
+          attrs: { ...attrs }
+        }
+      })
+      .filter(Boolean) as QQImageRecord['images']
+    if (!images.length) return
+
+    const record: QQImageRecord = {
+      messageId,
+      channelId: String(session?.channelId || ''),
+      guildId: String(session?.guildId || ''),
+      userId: String(session?.userId || ''),
+      timestamp: Number(session?.timestamp || session?.event?.timestamp || Date.now()),
+      images
+    }
+    const old = this.byMessageId.get(messageId)
+    if (old) {
+      const index = this.records.indexOf(old)
+      if (index >= 0) this.records.splice(index, 1)
+    }
+    this.records.push(record)
+    this.byMessageId.set(messageId, record)
+    const limit = clamp(this.config.qqImage.maxTrackedMessages, 10, 1000)
+    while (this.records.length > limit) {
+      const removed = this.records.shift()
+      if (removed) this.byMessageId.delete(removed.messageId)
+    }
+  }
+
+  find(messageId?: string) {
+    const key = messageId?.trim()
+    if (key) return this.byMessageId.get(key)
+    return this.records[this.records.length - 1]
   }
 }
 
@@ -672,6 +852,14 @@ export function apply(ctx: Context, config: Config) {
     prod: resolve(__dirname, '../dist')
   })
 
+  const qqImageTracker = new QQImageTracker(config)
+  if (config.qqImage.enabled) {
+    ctx.middleware((session, next) => {
+      qqImageTracker.remember(session)
+      return next()
+    })
+  }
+
   if (config.storage.localFallback) {
     ctx.inject(['server'], (ctx2) => {
       if (!ctx2.server) return
@@ -718,33 +906,34 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const registerTool = (ctx2: Context) => {
-    if (!config.tool.enabled) return
     if (!ctx2.chatluna?.platform?.registerTool) {
       ctx2.logger(name).warn('ChatLuna platform is unavailable; skip registering image resolver tool.')
       return
     }
-    const toolName = config.tool.name.trim() || 'image_search_resolve'
-    ctx2.effect(() => ctx2.chatluna.platform.registerTool(toolName, {
-      description: config.tool.description,
-      selector() {
-        return true
-      },
-      createTool() {
-        return new ImageResolverTool(ctx2, config)
-      },
-      meta: {
-        source: 'extension',
-        group: 'image-resolver',
-        tags: ['image-resolver', 'image-search', 'webdav'],
-        defaultAvailability: {
-          enabled: true,
-          main: true,
-          chatluna: true,
-          characterScope: 'all'
+    if (config.tool.enabled) {
+      const toolName = config.tool.name.trim() || 'image_search_resolve'
+      ctx2.effect(() => ctx2.chatluna.platform.registerTool(toolName, {
+        description: config.tool.description,
+        selector() {
+          return true
+        },
+        createTool() {
+          return new ImageResolverTool(ctx2, config)
+        },
+        meta: {
+          source: 'extension',
+          group: 'image-resolver',
+          tags: ['image-resolver', 'image-search', 'webdav'],
+          defaultAvailability: {
+            enabled: true,
+            main: true,
+            chatluna: true,
+            characterScope: 'all'
+          }
         }
-      }
-    }))
-    ctx2.logger(name).info('registered ChatLuna tool: %s', toolName)
+      }))
+      ctx2.logger(name).info('registered ChatLuna tool: %s', toolName)
+    }
 
     if (config.reverse.enabled) {
       const reverseToolName = config.reverse.toolName.trim() || 'image_reverse_search_resolve'
@@ -769,6 +958,31 @@ export function apply(ctx: Context, config: Config) {
         }
       }))
       ctx2.logger(name).info('registered ChatLuna reverse image tool: %s', reverseToolName)
+    }
+
+    if (config.qqImage.enabled) {
+      const qqImageToolName = config.qqImage.toolName.trim() || 'qq_image_link_resolve'
+      ctx2.effect(() => ctx2.chatluna.platform.registerTool(qqImageToolName, {
+        description: config.qqImage.description,
+        selector() {
+          return true
+        },
+        createTool() {
+          return new QQImageLinkResolverTool(ctx2, config, qqImageTracker)
+        },
+        meta: {
+          source: 'extension',
+          group: 'image-resolver',
+          tags: ['image-resolver', 'qq-image', 'onebot', 'napcat'],
+          defaultAvailability: {
+            enabled: true,
+            main: true,
+            chatluna: true,
+            characterScope: 'all'
+          }
+        }
+      }))
+      ctx2.logger(name).info('registered ChatLuna QQ image tool: %s', qqImageToolName)
     }
   }
 
@@ -1034,9 +1248,7 @@ export async function checkRemoteImageAlive(url: string, config: Pick<Config, 's
         contentLength: head.headers.get('content-length') || ''
       }
     }
-    if (![403, 405].includes(head.status)) {
-      return { ok: false, status: head.status, contentType: head.headers.get('content-type') || '' }
-    }
+    // Some QQ/NapCat CDN URLs reject HEAD with 400 but allow ranged GET.
   } catch {
     // Fall back to a ranged GET below.
   }
@@ -1123,6 +1335,25 @@ async function storeManagedImage(ctx: Context, config: Config, buffer: Buffer, f
     ...metadata
   }, null, 2))
   return publicUrl
+}
+
+async function downloadImageFromUrl(url: string, config: Config, options: { referer?: string } = {}) {
+  const headers: Record<string, string> = {
+    'User-Agent': config.image.userAgent,
+    'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8'
+  }
+  if (options.referer) headers.Referer = options.referer
+  const response = await fetchWithTimeout(url, { headers }, config.search.pageTimeoutMs)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const mime = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+  if (!mime.startsWith('image/')) throw new Error(`not image: ${mime || 'unknown content-type'}`)
+  const length = Number(response.headers.get('content-length') ?? '0')
+  if (length > config.image.maxDownloadBytes) throw new Error(`image too large: ${length}`)
+  const buffer = Buffer.from(await response.arrayBuffer())
+  if (buffer.length > config.image.maxDownloadBytes) throw new Error(`image too large: ${buffer.length}`)
+  const ext = mimeToExt(mime) || extFromUrl(url) || '.jpg'
+  const hash = createHash('sha1').update(buffer).digest('hex').slice(0, 12)
+  return { buffer, mime, filename: `resolved-qq-${hash}${ext}` }
 }
 
 function isManagedCacheFilename(filename: string) {

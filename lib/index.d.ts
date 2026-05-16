@@ -50,6 +50,13 @@ export interface Config {
         publicBaseUrl: string;
         customPrompt: string;
     };
+    qqImage: {
+        enabled: boolean;
+        toolName: string;
+        description: string;
+        maxTrackedMessages: number;
+        cacheOnResolve: boolean;
+    };
     storage: {
         localFallback: boolean;
         localDirectory: string;
@@ -86,7 +93,7 @@ interface SerpApiReverseResult {
     note?: string;
 }
 export declare const Config: Schema<Config>;
-export declare const usage = "\n<p><strong>Miyako ChatLuna \u56FE\u7247\u89E3\u6790\u5668</strong></p>\n<p>\u6CE8\u518C <code>image_search_resolve</code> \u548C <code>image_reverse_search_resolve</code> \u5DE5\u5177\uFF0C\u7528\u4E8E\u641C\u56FE\u3001\u4EE5\u56FE\u641C\u56FE\u3001\u4E0B\u8F7D\u5916\u94FE\u3001\u8F6C\u5B58\u4E3A Koishi \u53EF\u8BBF\u95EE\u94FE\u63A5\uFF0C\u5E76\u53EF\u9009\u540C\u6B65\u5230 WebDAV\u3002</p>\n<p>\u672C\u5730\u7F13\u5B58\u9ED8\u8BA4\u4FDD\u7559 7 \u5929\u3002\u542F\u7528 console \u540E\uFF0C\u53EF\u5728\u63D2\u4EF6\u8BE6\u60C5\u9875\u67E5\u770B\u7F13\u5B58\u56FE\u7247\u5E76\u68C0\u6D4B\u539F\u59CB\u76F4\u94FE\u5B58\u6D3B\u72B6\u6001\u3002</p>\n";
+export declare const usage = "\n<p><strong>Miyako ChatLuna \u56FE\u7247\u89E3\u6790\u5668</strong></p>\n<p>\u6CE8\u518C <code>image_search_resolve</code>\u3001<code>image_reverse_search_resolve</code> \u548C <code>qq_image_link_resolve</code> \u5DE5\u5177\uFF0C\u7528\u4E8E\u641C\u56FE\u3001\u4EE5\u56FE\u641C\u56FE\u3001\u6309\u9700\u89E3\u6790 QQ \u7FA4\u56FE\u7247\u76F4\u94FE\u3001\u4E0B\u8F7D\u5916\u94FE\u3001\u8F6C\u5B58\u4E3A Koishi \u53EF\u8BBF\u95EE\u94FE\u63A5\uFF0C\u5E76\u53EF\u9009\u540C\u6B65\u5230 WebDAV\u3002</p>\n<p>\u672C\u5730\u7F13\u5B58\u9ED8\u8BA4\u4FDD\u7559 7 \u5929\u3002\u542F\u7528 console \u540E\uFF0C\u53EF\u5728\u63D2\u4EF6\u8BE6\u60C5\u9875\u67E5\u770B\u7F13\u5B58\u56FE\u7247\u5E76\u68C0\u6D4B\u539F\u59CB\u76F4\u94FE\u5B58\u6D3B\u72B6\u6001\u3002</p>\n";
 declare module 'koishi' {
     interface Context {
         chatluna?: any;
@@ -168,12 +175,6 @@ export declare function checkRemoteImageAlive(url: string, config: Pick<Config, 
     contentType: string;
     contentLength: string;
     error?: undefined;
-} | {
-    ok: boolean;
-    status: number;
-    contentType: string;
-    error?: undefined;
-    contentLength?: undefined;
 }>;
 export declare function rewriteUrlBase(url: string, publicBaseUrl: string): string;
 export {};
