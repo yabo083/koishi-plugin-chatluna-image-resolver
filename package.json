@@ -4,12 +4,12 @@
   "description": "Miyako ChatLuna image resolver with keyword search, reverse image search, managed local cache, and optional WebDAV sync.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver.git"
+    "url": "git+https://github.com/yabo083/koishi-plugin-chatluna-image-resolver.git"
   },
   "bugs": {
-    "url": "https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver/issues"
+    "url": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver/issues"
   },
-  "homepage": "https://github.com/yabo083/koishi-plugin-miyako-chatluna-image-resolver#readme",
+  "homepage": "https://github.com/yabo083/koishi-plugin-chatluna-image-resolver#readme",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
