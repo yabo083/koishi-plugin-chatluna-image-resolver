@@ -37,9 +37,13 @@ chatluna-image-resolver:
     serpApiGl: cn
     serpApiHl: zh-cn
     serpApiSafe: active
+  delivery:
+    publicBaseUrl: http://172.26.0.1:5140
 ```
 
 如果希望 SerpApi 不足时继续尝试 Tavily/DuckDuckGo 页面解析，可将 `provider` 改为 `serpapi-fallback`。
+
+`delivery.publicBaseUrl` 用于控制最终返回给聊天平台的图片 URL 根地址。NapCat/OneBot 在 Docker 中运行时，容器内的 `127.0.0.1` 不是宿主 Koishi；此时应填写容器可访问宿主的地址，例如 Docker 网桥网关 `http://172.26.0.1:5140` 或局域网地址 `http://192.168.0.107:5140`。
 
 ## 存储
 

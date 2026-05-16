@@ -43,6 +43,9 @@ export interface Config {
         localDirectory: string;
         localPublicPath: string;
     };
+    delivery: {
+        publicBaseUrl: string;
+    };
     webdav: WebDavConfig;
     debug: boolean;
 }
@@ -85,4 +88,5 @@ export interface SerpApiImagesUrlOptions {
 }
 export declare function buildSerpApiImagesUrl(options: SerpApiImagesUrlOptions): string;
 export declare function serpApiImagesToCandidates(payload: any): ImageCandidate[];
+export declare function rewriteUrlBase(url: string, publicBaseUrl: string): string;
 export {};

@@ -3,6 +3,7 @@ const test = require('node:test')
 
 const {
   buildSerpApiImagesUrl,
+  rewriteUrlBase,
   serpApiImagesToCandidates
 } = require('../lib/index.js')
 
@@ -60,4 +61,27 @@ test('maps SerpApi image results to direct image candidates first', () => {
   assert.equal(candidates[1].url, 'https://cdn.example.test/thumb-only.webp')
   assert.equal(candidates[1].sourcePage, 'https://serpapi.com/')
   assert.equal(candidates[1].reason, 'serpapi-thumbnail')
+})
+
+test('rewrites stored image URLs for onebot docker-accessible delivery', () => {
+  assert.equal(
+    rewriteUrlBase(
+      'http://127.0.0.1:5140/chatluna-storage/temp/demo.webp',
+      'http://172.26.0.1:5140'
+    ),
+    'http://172.26.0.1:5140/chatluna-storage/temp/demo.webp'
+  )
+
+  assert.equal(
+    rewriteUrlBase(
+      '/chatluna-image-resolver/demo.webp',
+      'http://192.168.0.107:5140/'
+    ),
+    'http://192.168.0.107:5140/chatluna-image-resolver/demo.webp'
+  )
+
+  assert.equal(
+    rewriteUrlBase('https://example.com/image.png', ''),
+    'https://example.com/image.png'
+  )
 })

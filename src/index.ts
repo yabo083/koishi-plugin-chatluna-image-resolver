@@ -49,6 +49,9 @@ export interface Config {
     localDirectory: string
     localPublicPath: string
   }
+  delivery: {
+    publicBaseUrl: string
+  }
   webdav: WebDavConfig
   debug: boolean
 }
@@ -133,6 +136,11 @@ export const Config: Schema<Config> = Schema.intersect([
       localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
       localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。')
     }).description('本地转存')
+  }),
+  Schema.object({
+    delivery: Schema.object({
+      publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取图片的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景，例如 http://172.26.0.1:5140。留空则保留存储服务原 URL。')
+    }).description('发送链接')
   }),
   Schema.object({
     webdav: Schema.object({
@@ -434,7 +442,7 @@ class ImageResolver {
   private async store(buffer: Buffer, filename: string, mime: string) {
     if (this.ctx.chatluna_storage?.createTempFile) {
       const stored = await this.ctx.chatluna_storage.createTempFile(buffer, filename, this.config.image.tempExpireHours, mime)
-      return stored.url
+      return rewriteUrlBase(stored.url, this.config.delivery.publicBaseUrl)
     }
     if (!this.config.storage.localFallback) {
       throw new Error('chatluna-storage-service is not available and local fallback is disabled')
@@ -443,7 +451,7 @@ class ImageResolver {
     await mkdir(dir, { recursive: true })
     await writeFile(join(dir, filename), buffer)
     const base = trimTrailingSlash(this.ctx.server?.selfUrl ?? '')
-    return `${base}${this.config.storage.localPublicPath}/${filename}`
+    return rewriteUrlBase(`${base}${this.config.storage.localPublicPath}/${filename}`, this.config.delivery.publicBaseUrl)
   }
 
   private async syncWebDav(buffer: Buffer, filename: string, mime: string, failures: string[]) {
@@ -727,6 +735,18 @@ function absolutizeUrl(raw: string, base: string) {
 
 function normalizeImageUrl(url: string) {
   return url.replace(/&amp;/g, '&')
+}
+
+export function rewriteUrlBase(url: string, publicBaseUrl: string) {
+  const base = trimTrailingSlash(publicBaseUrl.trim())
+  if (!base) return url
+  try {
+    const parsed = new URL(url)
+    return `${base}${parsed.pathname}${parsed.search}${parsed.hash}`
+  } catch {
+    const path = url.startsWith('/') ? url : `/${url}`
+    return `${base}${path}`
+  }
 }
 
 function looksLikeImageUrl(url: string) {
