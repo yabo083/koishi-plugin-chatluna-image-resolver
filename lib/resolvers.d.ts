@@ -1,5 +1,17 @@
 import { Context } from 'koishi';
 import type { Config, StoredImage } from './types';
+export type ReverseProvider = Config['reverse']['provider'];
+export type ResolvedReverseProvider = Exclude<ReverseProvider, 'auto'>;
+export declare function selectReverseProvider(options: {
+    configuredProvider: ReverseProvider;
+    providerOverride?: ReverseProvider;
+    imageUrl: string;
+    publicImageUrl?: string;
+    hasGoogleKey: boolean;
+}): {
+    provider: ResolvedReverseProvider;
+    reason: string;
+};
 export declare class ImageResolver {
     private ctx;
     private config;
@@ -28,7 +40,8 @@ export declare class ReverseImageResolver {
     private ctx;
     private config;
     constructor(ctx: Context, config: Config);
-    resolve(imageUrl: string, providerOverride?: 'serpapi' | 'serpapi-lens' | 'google', maxResultsOverride?: number): Promise<{
+    resolve(imageUrl: string, providerOverride?: ReverseProvider, maxResultsOverride?: number): Promise<{
+        selectedProviderReason: string;
         cachedInputUrl: string | undefined;
         provider: "google";
         imageUrl: string;
@@ -38,6 +51,7 @@ export declare class ReverseImageResolver {
         error?: undefined;
         hint?: undefined;
     } | {
+        selectedProviderReason: string;
         cachedInputUrl: string | undefined;
         provider: "serpapi";
         imageUrl: string;
@@ -55,6 +69,7 @@ export declare class ReverseImageResolver {
         error?: undefined;
         hint?: undefined;
     } | {
+        selectedProviderReason: string;
         cachedInputUrl: string | undefined;
         provider: "serpapi-lens";
         imageUrl: string;
@@ -82,8 +97,9 @@ export declare class ReverseImageResolver {
         hint?: undefined;
     } | {
         ok: boolean;
-        provider: "serpapi" | "serpapi-lens" | "google";
+        provider: ResolvedReverseProvider;
         imageUrl: string;
+        selectedProviderReason: string;
         error: string;
         hint: string;
     }>;

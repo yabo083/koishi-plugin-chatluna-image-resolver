@@ -38,7 +38,7 @@ export interface Config {
     enabled: boolean
     toolName: string
     description: string
-    provider: 'serpapi' | 'serpapi-lens' | 'google'
+    provider: 'auto' | 'serpapi' | 'serpapi-lens' | 'google'
     serpApiKey: string
     serpApiGoogleDomain: string
     googleApiKey: string
@@ -46,17 +46,11 @@ export interface Config {
     publicBaseUrl: string
     customPrompt: string
   }
-  qqImage: {
-    enabled: boolean
-    toolName: string
-    description: string
-    maxTrackedMessages: number
-    cacheOnResolve: boolean
-  }
   qqMedia: {
     enabled: boolean
     toolName: string
     description: string
+    maxTrackedMessages: number
     cacheOnResolve: boolean
     maxDownloadBytes: number
     textPreviewBytes: number

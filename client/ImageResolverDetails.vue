@@ -1,6 +1,64 @@
 <template>
-  <div v-if="isOwn" class="miyako-media-cache">
-    <header class="miyako-media-cache__header">
+  <div v-if="isOwn" class="miyako-media-page">
+    <aside
+      data-miyako-media-nav="1"
+      class="miyako-media-nav"
+      :class="{ 'is-collapsed': isNavCollapsed }"
+      :style="navPositionStyle"
+    >
+      <div class="miyako-media-nav__header" @mousedown="startMove" @touchstart="startMove">
+        <span class="miyako-media-nav__grip" aria-hidden="true"></span>
+        <strong>media resolver</strong>
+        <button type="button" class="miyako-media-nav__toggle" @click="toggleNav" @mousedown.stop @touchstart.stop>
+          ^
+        </button>
+      </div>
+
+      <div class="miyako-media-nav__body">
+        <div class="miyako-media-nav__section">
+          <div class="miyako-media-nav__section-title">配置</div>
+          <button
+            v-for="item in navItems"
+            :key="item.id"
+            type="button"
+            class="miyako-media-nav__item"
+            :class="{ 'is-active': activeNavItem === item.id }"
+            @click="scrollTo(item)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+
+        <div class="miyako-media-nav__section">
+          <div class="miyako-media-nav__section-title">状态</div>
+          <div class="miyako-media-nav__status">
+            <span>Provider</span>
+            <strong>{{ reverseProvider }}</strong>
+          </div>
+          <div class="miyako-media-nav__status">
+            <span>媒体工具</span>
+            <strong>{{ mediaToolEnabled }}</strong>
+          </div>
+          <div class="miyako-media-nav__status">
+            <span>缓存</span>
+            <strong>{{ items.length }}</strong>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <header class="miyako-media-page__hero">
+      <div>
+        <h3>ChatLuna 媒体解析器</h3>
+        <p>搜图、反搜、QQ 图片/语音/文本文件直链与统一缓存</p>
+      </div>
+      <button type="button" class="miyako-media-cache__button is-primary" @click="loadCache" :disabled="loading">
+        {{ loading ? '刷新中' : '刷新缓存' }}
+      </button>
+    </header>
+
+    <section class="miyako-media-cache" data-panel-section="cache">
+      <header class="miyako-media-cache__header">
       <div>
         <h3>资源缓存</h3>
         <p>图片、语音和文本文件的按需转存记录</p>
@@ -8,7 +66,7 @@
       <button type="button" class="miyako-media-cache__button is-primary" @click="loadCache" :disabled="loading">
         {{ loading ? '刷新中' : '刷新' }}
       </button>
-    </header>
+      </header>
 
     <section class="miyako-media-cache__summary" aria-label="缓存概览">
       <div>
@@ -89,11 +147,12 @@
         </div>
       </article>
     </div>
+    </section>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ComputedRef, computed, inject, onMounted, reactive, ref, watch } from 'vue'
+import { ComputedRef, computed, inject, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 type CacheKind = 'all' | 'image' | 'audio' | 'text' | 'file'
 
@@ -114,18 +173,51 @@ interface CacheItem {
   mtime?: string
 }
 
+interface NavItem {
+  id: string
+  label: string
+  keys: string[]
+}
+
 const pluginName = inject<ComputedRef<string>>('plugin:name')
 const current = inject<ComputedRef<CurrentSettings>>('manager.settings.current')
 
-const isOwn = computed(() => pluginName?.value === 'koishi-plugin-miyako-chatluna-image-resolver')
+const ownPluginNames = new Set([
+  'koishi-plugin-miyako-chatluna-media-resolver',
+  'koishi-plugin-miyako-chatluna-image-resolver',
+])
+const isOwn = computed(() => ownPluginNames.has(pluginName?.value || ''))
 const config = computed(() => current?.value?.config || {})
 const publicPath = computed(() => config.value.storage?.localPublicPath || '/chatluna-image-resolver')
 const items = ref<CacheItem[]>([])
 const activeKind = ref<CacheKind>('all')
 const loading = ref(false)
 const error = ref('')
+const isNavCollapsed = ref(false)
+const activeNavItem = ref('')
 const checks = reactive<Record<string, any>>({})
 const checking = reactive<Record<string, boolean>>({})
+const navMouse = reactive({
+  moving: false,
+  top: 96,
+  right: 24,
+  startTop: 0,
+  startRight: 0,
+  startX: 0,
+  startY: 0,
+  width: 0,
+  height: 0,
+})
+
+const navItems: NavItem[] = [
+  { id: 'tool', label: '搜图工具', keys: ['tool', 'image_search_resolve'] },
+  { id: 'search', label: '搜索提供方', keys: ['search', 'serpApiKey', 'tavilyApiKey'] },
+  { id: 'image', label: '图片下载', keys: ['image', 'maxDownloadBytes', 'userAgent'] },
+  { id: 'reverse', label: '以图搜图', keys: ['reverse', 'image_reverse_search_resolve', 'googleApiKey'] },
+  { id: 'media', label: 'QQ 媒体', keys: ['qqMedia', 'qq_media_link_resolve', 'textPreviewBytes'] },
+  { id: 'storage', label: '本地缓存', keys: ['storage', 'localDirectory', 'retentionDays'] },
+  { id: 'delivery', label: '发送/WebDAV', keys: ['delivery', 'webdav', 'publicBaseUrl'] },
+]
 
 const filteredItems = computed(() => {
   if (activeKind.value === 'all') return items.value
@@ -133,6 +225,13 @@ const filteredItems = computed(() => {
 })
 
 const totalBytes = computed(() => items.value.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0))
+const navPositionStyle = computed(() => ({
+  top: `${navMouse.top}px`,
+  right: `${navMouse.right}px`,
+}))
+
+const reverseProvider = computed(() => config.value.reverse?.provider || 'auto')
+const mediaToolEnabled = computed(() => config.value.qqMedia?.enabled === false ? '关闭' : '开启')
 
 const latestTime = computed(() => {
   const latest = items.value[0]?.createdAt || items.value[0]?.mtime
@@ -215,20 +314,278 @@ function formatTime(value?: string, compact = false) {
   return date.toLocaleString(undefined, compact ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' } : undefined)
 }
 
+function toggleNav(event: MouseEvent) {
+  event.stopPropagation()
+  isNavCollapsed.value = !isNavCollapsed.value
+}
+
+function getText(node: HTMLElement) {
+  return `${node.innerHTML}\n${node.textContent || ''}`
+}
+
+function findSchemaNode(keys: string[]) {
+  const nodes = document.querySelectorAll<HTMLElement>('.k-schema-left')
+  for (const node of nodes) {
+    const text = getText(node)
+    if (keys.some((key) => text.includes(key))) return node
+  }
+}
+
+function scrollTo(item: NavItem) {
+  const node = findSchemaNode(item.keys)
+  if (!node) return
+  node.scrollIntoView({ block: 'center' })
+  activeNavItem.value = item.id
+}
+
+function getPointer(event: MouseEvent | TouchEvent) {
+  return event instanceof TouchEvent
+    ? event.touches[0] as unknown as MouseEvent
+    : event
+}
+
+function startMove(event: MouseEvent | TouchEvent) {
+  const pointer = getPointer(event)
+  const rect = (pointer.target as HTMLElement)
+    .closest('[data-miyako-media-nav="1"]')
+    ?.getBoundingClientRect()
+
+  if (rect) {
+    navMouse.width = rect.width
+    navMouse.height = rect.height
+  }
+
+  navMouse.startTop = navMouse.top
+  navMouse.startRight = navMouse.right
+  navMouse.startX = pointer.clientX
+  navMouse.startY = pointer.clientY
+  navMouse.moving = true
+}
+
+function onMove(event: MouseEvent | TouchEvent) {
+  if (!navMouse.moving) return
+  const pointer = getPointer(event)
+  const top = navMouse.startTop + pointer.clientY - navMouse.startY
+  const right = navMouse.startRight - (pointer.clientX - navMouse.startX)
+  const boundary = document.querySelector('.plugin-view')?.getBoundingClientRect()
+
+  let minTop = 0
+  let maxTop = window.innerHeight - navMouse.height
+  let minRight = 0
+  let maxRight = window.innerWidth - navMouse.width
+
+  if (boundary) {
+    minTop = boundary.top
+    maxTop = boundary.bottom - navMouse.height
+    minRight = window.innerWidth - boundary.right
+    maxRight = window.innerWidth - boundary.left - navMouse.width
+  }
+
+  navMouse.top = Math.min(Math.max(top, minTop), maxTop)
+  navMouse.right = Math.min(Math.max(right, minRight), maxRight)
+}
+
+function endMove() {
+  navMouse.moving = false
+}
+
+const observed = new Map<Element, string>()
+let observer: IntersectionObserver | undefined
+
+function initObserver() {
+  observer?.disconnect()
+  observed.clear()
+
+  observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue
+      const id = observed.get(entry.target)
+      if (id) activeNavItem.value = id
+    }
+  }, {
+    root: null,
+    rootMargin: '-40% 0px -40% 0px',
+    threshold: 0,
+  })
+
+  for (const item of navItems) {
+    const node = findSchemaNode(item.keys)
+    if (!node) continue
+    observer.observe(node)
+    observed.set(node, item.id)
+  }
+}
+
 onMounted(() => {
-  if (isOwn.value) loadCache()
+  if (!isOwn.value) return
+  loadCache()
+  setTimeout(initObserver, 800)
 })
 
 watch(isOwn, (value) => {
-  if (value) loadCache()
+  if (!value) return
+  loadCache()
+  setTimeout(initObserver, 800)
+})
+
+watch(current || ref(), () => {
+  if (isOwn.value) setTimeout(initObserver, 800)
+})
+
+window.addEventListener('mousemove', onMove)
+window.addEventListener('mouseup', endMove)
+window.addEventListener('touchmove', onMove)
+window.addEventListener('touchend', endMove)
+
+onUnmounted(() => {
+  window.removeEventListener('mousemove', onMove)
+  window.removeEventListener('mouseup', endMove)
+  window.removeEventListener('touchmove', onMove)
+  window.removeEventListener('touchend', endMove)
+  observer?.disconnect()
 })
 </script>
 
 <style scoped>
-.miyako-media-cache {
-  margin-top: 16px;
+.miyako-media-page {
+  position: relative;
   padding: 18px 0 4px;
-  border-top: 1px solid var(--k-color-divider, #ebeef5);
+}
+
+.miyako-media-page__hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--k-color-divider, #ebeef5);
+}
+
+.miyako-media-page__hero h3 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.35;
+}
+
+.miyako-media-page__hero p {
+  margin: 5px 0 0;
+  color: var(--k-text-light);
+  font-size: 12px;
+}
+
+.miyako-media-nav {
+  position: absolute;
+  z-index: 1000;
+  width: 214px;
+  max-width: 90vw;
+  overflow: hidden;
+  user-select: none;
+  border: 1px solid var(--k-card-border, #dcdfe6);
+  border-radius: 8px;
+  background: var(--k-card-bg, #fff);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .12);
+}
+
+.miyako-media-nav__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--k-color-divider, #ebeef5);
+  cursor: move;
+}
+
+.miyako-media-nav__header strong {
+  flex: 1 1 auto;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.miyako-media-nav__grip {
+  width: 10px;
+  height: 14px;
+  border-left: 2px dotted var(--k-text-light);
+  border-right: 2px dotted var(--k-text-light);
+  opacity: .7;
+}
+
+.miyako-media-nav__toggle {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--k-text-light);
+  cursor: pointer;
+}
+
+.miyako-media-nav.is-collapsed .miyako-media-nav__toggle {
+  transform: rotate(180deg);
+}
+
+.miyako-media-nav__body {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+}
+
+.miyako-media-nav.is-collapsed .miyako-media-nav__body {
+  display: none;
+}
+
+.miyako-media-nav__section-title {
+  margin-bottom: 6px;
+  color: var(--k-text-light);
+  font-size: 11px;
+}
+
+.miyako-media-nav__item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--k-text-normal);
+  cursor: pointer;
+  font-size: 12px;
+  text-align: left;
+}
+
+.miyako-media-nav__item:hover,
+.miyako-media-nav__item.is-active {
+  background: var(--k-hover-bg);
+  color: var(--k-color-primary);
+}
+
+.miyako-media-nav__status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+  color: var(--k-text-light);
+  font-size: 12px;
+}
+
+.miyako-media-nav__status strong {
+  overflow: hidden;
+  max-width: 112px;
+  color: var(--k-text-normal);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.miyako-media-cache {
+  padding: 18px 0 4px;
 }
 
 .miyako-media-cache__header {

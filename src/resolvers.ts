@@ -34,6 +34,53 @@ import {
   uniqueBy
 } from './utils'
 
+export type ReverseProvider = Config['reverse']['provider']
+export type ResolvedReverseProvider = Exclude<ReverseProvider, 'auto'>
+
+export function selectReverseProvider(options: {
+  configuredProvider: ReverseProvider
+  providerOverride?: ReverseProvider
+  imageUrl: string
+  publicImageUrl?: string
+  hasGoogleKey: boolean
+}) {
+  const requested = options.providerOverride ?? options.configuredProvider
+  const publicImageUrl = options.publicImageUrl ?? options.imageUrl
+  const publicUrl = isPublicHttpUrl(publicImageUrl)
+
+  if (requested !== 'auto') {
+    if ((requested === 'serpapi' || requested === 'serpapi-lens') && !publicUrl && options.hasGoogleKey) {
+      return {
+        provider: 'google' as const,
+        reason: 'Selected Google Vision because the configured URL-based provider requires a public URL and this image looks private/local.'
+      }
+    }
+    return {
+      provider: requested as ResolvedReverseProvider,
+      reason: `Using explicitly selected ${requested} provider.`
+    }
+  }
+
+  if (!publicUrl && options.hasGoogleKey) {
+    return {
+      provider: 'google' as const,
+      reason: 'Auto selected Google Vision because the image URL is private/local and must be submitted as downloaded bytes.'
+    }
+  }
+
+  if (/multimedia\.nt\.qq\.com\.cn|gchat\.qpic\.cn|c2cpicdw\.qpic\.cn|qpic\.cn/i.test(publicImageUrl)) {
+    return {
+      provider: 'serpapi-lens' as const,
+      reason: 'Auto selected SerpApi Google Lens for a QQ/Tencent CDN image URL.'
+    }
+  }
+
+  return {
+    provider: 'serpapi-lens' as const,
+    reason: 'Auto selected SerpApi Google Lens for a public image URL.'
+  }
+}
+
 export class ImageResolver {
   constructor(private ctx: Context, private config: Config) {}
 
@@ -318,8 +365,20 @@ export class ImageResolver {
 export class ReverseImageResolver {
   constructor(private ctx: Context, private config: Config) {}
 
-  async resolve(imageUrl: string, providerOverride?: 'serpapi' | 'serpapi-lens' | 'google', maxResultsOverride?: number) {
-    const provider = providerOverride ?? this.config.reverse.provider
+  async resolve(imageUrl: string, providerOverride?: ReverseProvider, maxResultsOverride?: number) {
+    const publicImageUrl = rewriteImageUrlForPublicAccess(
+      imageUrl,
+      this.ctx.chatluna_storage?.config?.serverPath || this.ctx.server?.selfUrl || '',
+      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
+    )
+    const selected = selectReverseProvider({
+      configuredProvider: this.config.reverse.provider,
+      providerOverride,
+      imageUrl,
+      publicImageUrl,
+      hasGoogleKey: Boolean(this.config.reverse.googleApiKey.trim())
+    })
+    const provider = selected.provider
     const maxResults = clamp(maxResultsOverride ?? this.config.reverse.maxResults, 1, 50)
     try {
       const result = provider === 'google'
@@ -330,6 +389,7 @@ export class ReverseImageResolver {
       const cachedInputUrl = await this.cacheReverseInput(imageUrl, provider)
       return {
         ...attachReverseNote(result, this.config),
+        selectedProviderReason: selected.reason,
         cachedInputUrl
       }
     } catch (error) {
@@ -337,6 +397,7 @@ export class ReverseImageResolver {
         ok: false,
         provider,
         imageUrl,
+        selectedProviderReason: selected.reason,
         error: formatError(error),
         hint: provider === 'google'
           ? 'Google provider downloads the image and sends base64 bytes to Google Cloud Vision Web Detection.'

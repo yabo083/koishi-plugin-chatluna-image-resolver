@@ -14,6 +14,7 @@ const {
   isManagedCacheFilename,
   mimeFromFilename,
   rewriteImageUrlForPublicAccess,
+  selectReverseProvider,
   serpApiLensPayloadToResult,
   storeManagedAsset
 } = require('../lib/index.js')
@@ -106,6 +107,32 @@ test('validates whether an image URL is public enough for URL-based reverse prov
   assert.equal(isPublicHttpUrl('http://127.0.0.1:5140/image.png'), false)
   assert.equal(isPublicHttpUrl('http://192.168.1.2/image.png'), false)
   assert.equal(isPublicHttpUrl('http://koishi/image.png'), false)
+})
+
+test('selects reverse provider for public QQ CDN and private cached URLs', () => {
+  assert.deepEqual(selectReverseProvider({
+    configuredProvider: 'auto',
+    imageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc',
+    hasGoogleKey: true
+  }).provider, 'serpapi-lens')
+
+  assert.deepEqual(selectReverseProvider({
+    configuredProvider: 'auto',
+    imageUrl: 'http://127.0.0.1:5140/chatluna-storage/temp/a.png',
+    hasGoogleKey: true
+  }).provider, 'google')
+
+  assert.deepEqual(selectReverseProvider({
+    configuredProvider: 'serpapi',
+    imageUrl: 'http://127.0.0.1:5140/chatluna-storage/temp/a.png',
+    hasGoogleKey: true
+  }).provider, 'google')
+
+  assert.deepEqual(selectReverseProvider({
+    configuredProvider: 'serpapi',
+    imageUrl: 'https://cdn.example.test/a.png',
+    hasGoogleKey: true
+  }).provider, 'serpapi')
 })
 
 test('rewrites ChatLuna storage URLs before sending them to public-only providers', () => {

@@ -17,7 +17,7 @@ import {
   trimTrailingSlash
 } from './utils'
 
-const loggerName = 'miyako-chatluna-image-resolver'
+const loggerName = 'miyako-chatluna-media-resolver'
 
 export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; now?: number }) {
   const now = options.now ?? Date.now()

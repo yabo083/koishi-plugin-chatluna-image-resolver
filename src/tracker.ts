@@ -38,21 +38,10 @@ export class QQImageTracker {
     }
     this.records.push(record)
     this.byMessageId.set(messageId, record)
-    const limit = clamp(this.config.qqImage.maxTrackedMessages, 10, 1000)
+    const limit = clamp(this.config.qqMedia.maxTrackedMessages, 10, 1000)
     while (this.records.length > limit) {
       const removed = this.records.shift()
       if (removed) this.byMessageId.delete(removed.messageId)
-    }
-  }
-
-  find(messageId?: string) {
-    const key = messageId?.trim()
-    if (key) {
-      const record = this.byMessageId.get(key)
-      return record?.images.length ? record : undefined
-    }
-    for (let index = this.records.length - 1; index >= 0; index--) {
-      if (this.records[index].images.length) return this.records[index]
     }
   }
 

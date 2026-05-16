@@ -5,7 +5,6 @@ export declare class QQImageTracker {
     private byMessageId;
     constructor(config: Config);
     remember(session: any): void;
-    find(messageId?: string): QQImageRecord | undefined;
     findMedia(messageId?: string, kind?: TrackedMediaKind): {
         record: QQImageRecord;
     } | undefined;
