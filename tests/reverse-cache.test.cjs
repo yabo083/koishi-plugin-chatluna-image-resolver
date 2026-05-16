@@ -9,9 +9,13 @@ const {
   buildSerpApiGoogleLensUrl,
   buildSerpApiReverseImageUrl,
   cleanupManagedImageCache,
+  detectManagedAssetKind,
   isPublicHttpUrl,
+  isManagedCacheFilename,
+  mimeFromFilename,
   rewriteImageUrlForPublicAccess,
-  serpApiLensPayloadToResult
+  serpApiLensPayloadToResult,
+  storeManagedAsset
 } = require('../lib/index.js')
 
 test('builds Google Vision web detection request with downloaded image bytes as base64', () => {
@@ -154,4 +158,95 @@ test('cleans only managed cached image files older than retention window', async
   await assert.rejects(() => stat(oldManifest))
   assert.equal(await readFile(freshImage, 'utf8'), 'fresh')
   assert.equal(await readFile(unmanagedOld, 'utf8'), 'manual')
+})
+
+test('recognizes managed audio and text cache artifacts', () => {
+  assert.equal(isManagedCacheFilename('resolved-audio-a1b2c3.silk'), true)
+  assert.equal(isManagedCacheFilename('resolved-text-a1b2c3.md'), true)
+  assert.equal(isManagedCacheFilename('resolved-file-a1b2c3.pdf.json'), true)
+  assert.equal(isManagedCacheFilename('manual-note.txt'), false)
+
+  assert.equal(detectManagedAssetKind('voice.silk', 'audio/silk'), 'audio')
+  assert.equal(detectManagedAssetKind('notes.md', 'text/markdown'), 'text')
+  assert.equal(detectManagedAssetKind('image.webp', 'image/webp'), 'image')
+  assert.equal(detectManagedAssetKind('archive.zip', 'application/zip'), 'file')
+
+  assert.equal(mimeFromFilename('voice.silk'), 'audio/silk')
+  assert.equal(mimeFromFilename('notes.md'), 'text/markdown; charset=utf-8')
+})
+
+test('cleans managed media cache artifacts older than retention window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'media-resolver-cache-'))
+  await mkdir(root, { recursive: true })
+  const oldAudio = join(root, 'resolved-audio-old.silk')
+  const oldText = join(root, 'resolved-text-old.md')
+  const oldTextManifest = join(root, 'resolved-text-old.md.json')
+  const freshPdf = join(root, 'resolved-file-fresh.pdf')
+  const unmanagedOld = join(root, 'notes.md')
+  await writeFile(oldAudio, 'old-audio')
+  await writeFile(oldText, 'old-text')
+  await writeFile(oldTextManifest, '{"old":true}')
+  await writeFile(freshPdf, 'fresh-pdf')
+  await writeFile(unmanagedOld, 'manual')
+
+  const now = Date.now()
+  const eightDaysAgo = now - 8 * 24 * 60 * 60 * 1000
+  const oneDayAgo = now - 24 * 60 * 60 * 1000
+  for (const file of [oldAudio, oldText, oldTextManifest, unmanagedOld]) {
+    await require('node:fs/promises').utimes(file, eightDaysAgo / 1000, eightDaysAgo / 1000)
+  }
+  await require('node:fs/promises').utimes(freshPdf, oneDayAgo / 1000, oneDayAgo / 1000)
+
+  const summary = await cleanupManagedImageCache(root, {
+    retentionDays: 7,
+    now
+  })
+
+  assert.equal(summary.deleted, 3)
+  await assert.rejects(() => stat(oldAudio))
+  await assert.rejects(() => stat(oldText))
+  await assert.rejects(() => stat(oldTextManifest))
+  assert.equal(await readFile(freshPdf, 'utf8'), 'fresh-pdf')
+  assert.equal(await readFile(unmanagedOld, 'utf8'), 'manual')
+})
+
+test('writes a visible manifest when storing through ChatLuna storage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'media-resolver-storage-'))
+  const config = {
+    image: { tempExpireHours: 168 },
+    storage: {
+      localDirectory: 'cache',
+      retentionDays: 7
+    },
+    delivery: {
+      publicBaseUrl: 'https://bot.example.test'
+    }
+  }
+  const ctx = {
+    baseDir: root,
+    logger() {
+      return { warn() {} }
+    },
+    chatluna_storage: {
+      async createTempFile(buffer, filename, expireHours, mime) {
+        assert.equal(buffer.toString('utf8'), 'voice')
+        assert.equal(filename, 'resolved-audio-voice.silk')
+        assert.equal(expireHours, 168)
+        assert.equal(mime, 'audio/silk')
+        return { url: 'http://127.0.0.1:5140/chatluna-storage/temp/resolved-audio-voice.silk' }
+      }
+    }
+  }
+
+  const url = await storeManagedAsset(ctx, config, Buffer.from('voice'), 'resolved-audio-voice.silk', 'audio/silk', {
+    kind: 'audio',
+    originalUrl: 'https://multimedia.nt.qq.com.cn/download?fileid=voice'
+  })
+
+  assert.equal(url, 'https://bot.example.test/chatluna-storage/temp/resolved-audio-voice.silk')
+  const manifest = JSON.parse(await readFile(join(root, 'cache', 'resolved-audio-voice.silk.json'), 'utf8'))
+  assert.equal(manifest.kind, 'audio')
+  assert.equal(manifest.storage, 'chatluna-storage')
+  assert.equal(manifest.url, url)
+  assert.equal(manifest.bytes, 5)
 })
