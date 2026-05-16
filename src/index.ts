@@ -48,7 +48,7 @@ export interface Config {
     enabled: boolean
     toolName: string
     description: string
-    provider: 'serpapi' | 'google'
+    provider: 'serpapi' | 'serpapi-lens' | 'google'
     serpApiKey: string
     serpApiGoogleDomain: string
     googleApiKey: string
@@ -148,6 +148,30 @@ interface SerpApiReverseResult {
   note?: string
 }
 
+interface SerpApiLensResult {
+  provider: 'serpapi-lens'
+  imageUrl: string
+  searchInformation?: unknown
+  visualMatches: Array<{
+    position?: number
+    title?: string
+    link?: string
+    source?: string
+    sourceIcon?: string
+    thumbnail?: string
+    image?: string
+    price?: string
+    inStock?: boolean
+  }>
+  relatedContent: Array<{
+    title?: string
+    link?: string
+    thumbnail?: string
+    serpapiLink?: string
+  }>
+  note?: string
+}
+
 const TOOL_SCHEMA = z.object({
   query: z.string().min(1).describe('Image search query, for example "天童爱丽丝 普通图片" or "Tendou Aris fanart".'),
   count: z.number().int().min(1).max(8).optional().describe('Number of images to resolve. Defaults to 1.'),
@@ -155,8 +179,8 @@ const TOOL_SCHEMA = z.object({
 })
 
 const REVERSE_TOOL_SCHEMA = z.object({
-  imageUrl: z.string().url().describe('Image URL to reverse search. Google downloads it and sends base64 bytes; SerpApi requires a public URL.'),
-  provider: z.enum(['serpapi', 'google']).optional().describe('Override the configured reverse-search provider for this call.'),
+  imageUrl: z.string().url().describe('Image URL to reverse search. Google downloads it and sends base64 bytes; SerpApi URL-based providers require a public URL.'),
+  provider: z.enum(['serpapi', 'serpapi-lens', 'google']).optional().describe('Override the configured reverse-search provider for this call. Use serpapi-lens for QQ/NapCat CDN image URLs.'),
   maxResults: z.number().int().min(1).max(50).optional().describe('Maximum reverse-search results. Defaults to the plugin config.')
 })
 
@@ -213,9 +237,10 @@ export const Config: Schema<Config> = Schema.intersect([
     reverse: Schema.object({
       enabled: Schema.boolean().default(true).description('是否注册以图搜图 ChatLuna 工具。'),
       toolName: Schema.string().default('image_reverse_search_resolve').description('以图搜图工具名称。'),
-      description: Schema.string().role('textarea').default('Reverse-searches an image with SerpApi Google Reverse Image or Google Vision Web Detection. Use Google when the image is in ChatLuna cache or any fetchable URL because this plugin sends base64 image bytes; use SerpApi only when the image URL is publicly reachable.').description('以图搜图工具描述。'),
+      description: Schema.string().role('textarea').default('Reverse-searches an image with SerpApi Google Reverse Image, SerpApi Google Lens, or Google Vision Web Detection. Use serpapi-lens for QQ/NapCat image CDN URLs; use Google when the image is only locally fetchable because this plugin sends base64 image bytes.').description('以图搜图工具描述。'),
       provider: Schema.union([
         Schema.const('serpapi').description('SerpApi Google Reverse Image API，使用 image_url。'),
+        Schema.const('serpapi-lens').description('SerpApi Google Lens API，使用 url，适合 QQ/NapCat 原始图片 CDN 链接。'),
         Schema.const('google').description('Google Cloud Vision Web Detection，插件会下载图片并转为 base64。')
       ]).default('serpapi').description('以图搜图提供方。'),
       serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key；留空则复用搜索配置中的 SerpApi Key。'),
@@ -403,8 +428,8 @@ class QQImageLinkResolverTool extends StructuredTool {
       mime: mime || alive.contentType || undefined,
       recommendations: {
         serpapi: publicUrl && alive.ok
-          ? 'Use originalUrl for URL-based SerpApi engines. If google_reverse_image returns no results, try a Lens-capable flow or Google Vision/base64.'
-          : 'Do not use this URL for SerpApi because it is not a confirmed public, fetchable HTTP image URL.',
+          ? 'Use originalUrl with provider=serpapi-lens. QQ CDN URLs often produce empty results with google_reverse_image even when Google Lens can match them.'
+          : 'Do not use this URL for SerpApi URL-based providers because it is not a confirmed public, fetchable HTTP image URL.',
         googleVision: cachedUrl
           ? 'Use cachedUrl or originalUrl; the plugin can download bytes and submit base64 to Google Vision.'
           : 'Use originalUrl if Koishi can fetch it; cache failed or was disabled.',
@@ -756,12 +781,14 @@ class ImageResolver {
 class ReverseImageResolver {
   constructor(private ctx: Context, private config: Config) {}
 
-  async resolve(imageUrl: string, providerOverride?: 'serpapi' | 'google', maxResultsOverride?: number) {
+  async resolve(imageUrl: string, providerOverride?: 'serpapi' | 'serpapi-lens' | 'google', maxResultsOverride?: number) {
     const provider = providerOverride ?? this.config.reverse.provider
     const maxResults = clamp(maxResultsOverride ?? this.config.reverse.maxResults, 1, 50)
     try {
       const result = provider === 'google'
         ? await this.callGoogleVision(imageUrl, maxResults)
+        : provider === 'serpapi-lens'
+          ? await this.callSerpApiLens(imageUrl, maxResults)
         : await this.callSerpApi(imageUrl, maxResults)
       return attachReverseNote(result, this.config)
     } catch (error) {
@@ -772,7 +799,7 @@ class ReverseImageResolver {
         error: formatError(error),
         hint: provider === 'google'
           ? 'Google provider downloads the image and sends base64 bytes to Google Cloud Vision Web Detection.'
-          : 'URL-based reverse image providers require a public image URL. Use reverse.publicBaseUrl to rewrite ChatLuna cached local URLs before calling them.'
+          : 'URL-based SerpApi providers require a public image URL. Use serpapi-lens for QQ/NapCat CDN URLs and reverse.publicBaseUrl to rewrite ChatLuna cached local URLs before calling them.'
       }
     }
   }
@@ -802,6 +829,34 @@ class ReverseImageResolver {
     if (!response.ok) throw new Error(payload?.error || `SerpApi HTTP ${response.status}`)
     if (payload?.error) throw new Error(String(payload.error))
     return serpApiReversePayloadToResult(imageUrl, payload, maxResults)
+  }
+
+  private async callSerpApiLens(imageUrl: string, maxResults: number): Promise<SerpApiLensResult> {
+    const apiKey = (this.config.reverse.serpApiKey || this.config.search.serpApiKey).trim()
+    if (!apiKey) throw new Error('missing SerpApi API key')
+    const publicImageUrl = rewriteImageUrlForPublicAccess(
+      imageUrl,
+      this.ctx.chatluna_storage?.config?.serverPath || this.ctx.server?.selfUrl || '',
+      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
+    )
+    if (!isPublicHttpUrl(publicImageUrl)) {
+      throw new Error('SerpApi Google Lens requires a public image URL; the current URL looks private or local')
+    }
+    const response = await fetchWithTimeout(buildSerpApiGoogleLensUrl({
+      apiKey,
+      imageUrl: publicImageUrl,
+      hl: this.config.search.serpApiHl || 'zh-cn',
+      type: 'visual_matches'
+    }), {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': this.config.image.userAgent
+      }
+    }, this.config.search.pageTimeoutMs)
+    const payload: any = await response.json()
+    if (!response.ok) throw new Error(payload?.error || `SerpApi Google Lens HTTP ${response.status}`)
+    if (payload?.error) throw new Error(String(payload.error))
+    return serpApiLensPayloadToResult(imageUrl, payload, maxResults)
   }
 
   private async callGoogleVision(imageUrl: string, maxResults: number): Promise<GoogleReverseResult> {
@@ -1009,11 +1064,11 @@ export function apply(ctx: Context, config: Config) {
     )
 
   ctx.command('image-resolver.reverse <imageUrl:string>', '以图搜图并返回来源线索')
-    .option('provider', '-p <provider:string> 指定 serpapi 或 google')
+    .option('provider', '-p <provider:string> 指定 serpapi、serpapi-lens 或 google')
     .option('maxResults', '-m <maxResults:number> 最大返回结果数')
     .action(async ({ options }, imageUrl) => {
       if (!imageUrl?.trim()) return '请输入图片 URL。'
-      const provider = options?.provider === 'google' || options?.provider === 'serpapi'
+      const provider = options?.provider === 'google' || options?.provider === 'serpapi' || options?.provider === 'serpapi-lens'
         ? options.provider
         : undefined
       const resolver = new ReverseImageResolver(ctx, config)
@@ -1134,6 +1189,21 @@ export function buildSerpApiReverseImageUrl(options: {
   return url.href
 }
 
+export function buildSerpApiGoogleLensUrl(options: {
+  apiKey: string
+  imageUrl: string
+  hl?: string
+  type?: 'all' | 'exact_matches' | 'visual_matches' | 'products' | 'about_this_image'
+}) {
+  const url = new URL('https://serpapi.com/search.json')
+  url.searchParams.set('engine', 'google_lens')
+  url.searchParams.set('api_key', options.apiKey)
+  url.searchParams.set('url', options.imageUrl)
+  if (options.hl?.trim()) url.searchParams.set('hl', options.hl.trim())
+  if (options.type?.trim()) url.searchParams.set('type', options.type.trim())
+  return url.href
+}
+
 export function serpApiReversePayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiReverseResult {
   const raw = Array.isArray(payload?.image_results) ? payload.image_results : []
   return {
@@ -1147,6 +1217,33 @@ export function serpApiReversePayloadToResult(imageUrl: string, payload: any, ma
       source: typeof item?.source === 'string' ? item.source : '',
       thumbnail: typeof item?.thumbnail === 'string' ? item.thumbnail : '',
       original: typeof item?.original === 'string' ? item.original : ''
+    }))
+  }
+}
+
+export function serpApiLensPayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiLensResult {
+  const visualMatches = Array.isArray(payload?.visual_matches) ? payload.visual_matches : []
+  const relatedContent = Array.isArray(payload?.related_content) ? payload.related_content : []
+  return {
+    provider: 'serpapi-lens',
+    imageUrl,
+    searchInformation: payload?.search_information,
+    visualMatches: visualMatches.slice(0, maxResults).map((item: any) => ({
+      position: numberOrUndefined(item?.position),
+      title: typeof item?.title === 'string' ? item.title : '',
+      link: typeof item?.link === 'string' ? item.link : '',
+      source: typeof item?.source === 'string' ? item.source : '',
+      sourceIcon: typeof item?.source_icon === 'string' ? item.source_icon : '',
+      thumbnail: typeof item?.thumbnail === 'string' ? item.thumbnail : '',
+      image: typeof item?.image === 'string' ? item.image : '',
+      price: typeof item?.price === 'string' ? item.price : '',
+      inStock: typeof item?.in_stock === 'boolean' ? item.in_stock : undefined
+    })),
+    relatedContent: relatedContent.slice(0, maxResults).map((item: any) => ({
+      title: typeof item?.title === 'string' ? item.title : '',
+      link: typeof item?.link === 'string' ? item.link : '',
+      thumbnail: typeof item?.thumbnail === 'string' ? item.thumbnail : '',
+      serpapiLink: typeof item?.serpapi_link === 'string' ? item.serpapi_link : ''
     }))
   }
 }
@@ -1298,11 +1395,13 @@ function normalizeWebDetection(web: WebDetection, maxResults: number): WebDetect
   }
 }
 
-function attachReverseNote<T extends GoogleReverseResult | SerpApiReverseResult>(result: T, config: Config): T & { ok: true; note: string } {
+function attachReverseNote<T extends GoogleReverseResult | SerpApiReverseResult | SerpApiLensResult>(result: T, config: Config): T & { ok: true; note: string } {
   const notes = [
     result.provider === 'google'
       ? 'Google provider used downloaded image bytes encoded as base64, so ChatLuna cached/local image URLs are acceptable if Koishi can fetch them.'
-      : 'SerpApi provider used Google Reverse Image with image_url, so imageUrl must be publicly reachable by SerpApi/Google.'
+      : result.provider === 'serpapi-lens'
+        ? 'SerpApi Google Lens provider used engine=google_lens with url. This is recommended for QQ/NapCat Tencent CDN image URLs when Google Reverse Image returns empty results.'
+        : 'SerpApi provider used Google Reverse Image with image_url, so imageUrl must be publicly reachable by SerpApi/Google.'
   ]
   if (config.reverse.customPrompt.trim()) notes.push(config.reverse.customPrompt.trim())
   return {

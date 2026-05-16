@@ -42,7 +42,7 @@ export interface Config {
         enabled: boolean;
         toolName: string;
         description: string;
-        provider: 'serpapi' | 'google';
+        provider: 'serpapi' | 'serpapi-lens' | 'google';
         serpApiKey: string;
         serpApiGoogleDomain: string;
         googleApiKey: string;
@@ -89,6 +89,29 @@ interface SerpApiReverseResult {
         source?: string;
         thumbnail?: string;
         original?: string;
+    }>;
+    note?: string;
+}
+interface SerpApiLensResult {
+    provider: 'serpapi-lens';
+    imageUrl: string;
+    searchInformation?: unknown;
+    visualMatches: Array<{
+        position?: number;
+        title?: string;
+        link?: string;
+        source?: string;
+        sourceIcon?: string;
+        thumbnail?: string;
+        image?: string;
+        price?: string;
+        inStock?: boolean;
+    }>;
+    relatedContent: Array<{
+        title?: string;
+        link?: string;
+        thumbnail?: string;
+        serpapiLink?: string;
     }>;
     note?: string;
 }
@@ -149,7 +172,14 @@ export declare function buildSerpApiReverseImageUrl(options: {
     imageUrl: string;
     googleDomain?: string;
 }): string;
+export declare function buildSerpApiGoogleLensUrl(options: {
+    apiKey: string;
+    imageUrl: string;
+    hl?: string;
+    type?: 'all' | 'exact_matches' | 'visual_matches' | 'products' | 'about_this_image';
+}): string;
 export declare function serpApiReversePayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiReverseResult;
+export declare function serpApiLensPayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiLensResult;
 export declare function isPublicHttpUrl(url: string): boolean;
 export declare function rewriteImageUrlForPublicAccess(imageUrl: string, privateBaseUrl: string, publicBaseUrl: string): string;
 export declare function cleanupManagedImageCache(directory: string, options: {

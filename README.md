@@ -20,9 +20,10 @@ SerpApi 会调用 Google Images Search API（`engine=google_images`），优先�
 
 ## 以图搜图
 
-当前保留两条 provider：
+当前保留三条 provider：
 
 - `serpapi`：调用 SerpApi Google Reverse Image（`engine=google_reverse_image`），参数是公网 `image_url`。
+- `serpapi-lens`：调用 SerpApi Google Lens（`engine=google_lens`），参数是公网 `url`，默认取 `visual_matches`，适合 NapCat/QQ 原始腾讯 CDN 图片链接。
 - `google`：调用 Google Cloud Vision Web Detection。插件会先下载图片，再把图片字节 base64 编码后放入 `image.content`，适合 ChatLuna 缓存图或本地可读 URL。
 
 SerpApi 官方接口不支持直接传 base64 图片，因此用户自行上传、但没有公网直链的图片应走 `google` provider。
@@ -36,6 +37,7 @@ NapCat 的 OneBot 图片段通常包含腾讯 CDN `url`。Koishi onebot 适配�
 - 可传入 `messageId`，也可省略并使用最近一条含图消息。
 - 工具会返回 `originalUrl`、公网/可下载检测结果、按需缓存后的 `cachedUrl`，以及针对 SerpApi、Google Vision、ChatLuna 本地发送的使用建议。
 - 默认 `cacheOnResolve: true`，只有工具被调用时才下载并进入 7 天缓存管理，避免群里每张图片都占用磁盘。
+- QQ 原始腾讯 CDN 直链不应默认交给 `google_reverse_image`；实际反搜优先用 `image_reverse_search_resolve` 的 `provider: "serpapi-lens"`。
 
 实测注意：QQ CDN 可能拒绝 `HEAD`，但允许 `Range GET` 或普通 `GET`，所以直链检测会自动回退到 ranged GET。
 

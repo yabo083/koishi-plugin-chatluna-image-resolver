@@ -6,10 +6,12 @@ const test = require('node:test')
 
 const {
   buildGoogleVisionWebDetectionRequest,
+  buildSerpApiGoogleLensUrl,
   buildSerpApiReverseImageUrl,
   cleanupManagedImageCache,
   isPublicHttpUrl,
-  rewriteImageUrlForPublicAccess
+  rewriteImageUrlForPublicAccess,
+  serpApiLensPayloadToResult
 } = require('../lib/index.js')
 
 test('builds Google Vision web detection request with downloaded image bytes as base64', () => {
@@ -45,6 +47,54 @@ test('builds SerpApi Google reverse image URL compatible with the official playg
   assert.equal(url.searchParams.get('api_key'), 'serp-key')
   assert.equal(url.searchParams.get('google_domain'), 'google.com')
   assert.equal(url.searchParams.get('image_url'), 'https://static.zerochan.net/Tendou.Alice.full.3860632.jpg')
+})
+
+test('builds SerpApi Google Lens URL for QQ CDN visual matches', () => {
+  const qqUrl = 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=xyz'
+  const url = new URL(buildSerpApiGoogleLensUrl({
+    apiKey: 'serp-key',
+    imageUrl: qqUrl,
+    hl: 'zh-cn',
+    type: 'visual_matches'
+  }))
+
+  assert.equal(url.origin, 'https://serpapi.com')
+  assert.equal(url.pathname, '/search.json')
+  assert.equal(url.searchParams.get('engine'), 'google_lens')
+  assert.equal(url.searchParams.get('api_key'), 'serp-key')
+  assert.equal(url.searchParams.get('url'), qqUrl)
+  assert.equal(url.searchParams.get('hl'), 'zh-cn')
+  assert.equal(url.searchParams.get('type'), 'visual_matches')
+})
+
+test('maps SerpApi Google Lens visual matches', () => {
+  const result = serpApiLensPayloadToResult('https://example.test/image.jpg', {
+    visual_matches: [
+      {
+        position: 1,
+        title: 'hina (blue archive) drawn by nekoya_(liu) | Danbooru',
+        link: 'https://danbooru.donmai.us/posts/123',
+        source: 'Danbooru',
+        source_icon: 'https://example.test/icon.png',
+        thumbnail: 'https://example.test/thumb.jpg',
+        image: 'https://example.test/full.jpg'
+      }
+    ],
+    related_content: [
+      {
+        title: 'Related',
+        link: 'https://example.test/related',
+        serpapi_link: 'https://serpapi.com/search.json?engine=google_lens'
+      }
+    ]
+  }, 5)
+
+  assert.equal(result.provider, 'serpapi-lens')
+  assert.equal(result.visualMatches.length, 1)
+  assert.equal(result.visualMatches[0].source, 'Danbooru')
+  assert.equal(result.visualMatches[0].image, 'https://example.test/full.jpg')
+  assert.equal(result.relatedContent.length, 1)
+  assert.equal(result.relatedContent[0].title, 'Related')
 })
 
 test('validates whether an image URL is public enough for URL-based reverse providers', () => {
