@@ -23,10 +23,12 @@ import {
   checkRemoteImageAlive,
   cleanupManagedImageCache,
   downloadMediaFromUrl,
+  findManagedCacheByOriginalUrl,
   listManagedImageCache,
   markManagedCacheEntryExpired,
   readJsonBody,
-  storeManagedAsset
+  storeManagedAsset,
+  sweepManagedCacheOriginalUrls
 } from './cache'
 import {
   buildGoogleVisionWebDetectionRequest,
@@ -57,9 +59,12 @@ export type { TrackedMediaKind, WebDavConfig } from './types'
 export {
   checkRemoteImageAlive,
   cleanupManagedImageCache,
+  findManagedCacheByOriginalUrl,
   isManagedCacheFilename,
   listManagedImageCache,
+  markManagedCacheEntryChecked,
   markManagedCacheEntryExpired,
+  sweepManagedCacheOriginalUrls,
   storeManagedAsset
 } from './cache'
 export {
@@ -100,6 +105,14 @@ const QQ_MEDIA_TOOL_SCHEMA = z.object({
   target: z.enum(['auto', 'serpapi', 'google', 'chatluna']).optional().describe('Consumer that needs the media URL. Defaults to auto.'),
   readText: z.boolean().optional().describe('For text files, include a bounded UTF-8 text preview. Defaults to true for text files.'),
   maxTextBytes: z.number().int().min(256).max(262144).optional().describe('Maximum bytes to include in text preview. Defaults to plugin config.')
+})
+
+const QQ_MEDIA_CACHE_LOOKUP_SCHEMA = z.object({
+  messageId: z.string().optional().describe('QQ/OneBot message id that contains media or a file. If omitted, recent tracked media messages are returned.'),
+  mediaIndex: z.number().int().min(0).optional().describe('Zero-based media index in the message. Defaults to all matching media.'),
+  imageIndex: z.number().int().min(0).optional().describe('Backward-compatible image index alias. When provided, kind defaults to image and this value is used as mediaIndex.'),
+  kind: z.enum(['image', 'audio', 'text', 'file']).optional().describe('Optional media kind filter.'),
+  limit: z.number().int().min(1).max(20).optional().describe('How many recent media messages to list when messageId is omitted. Defaults to 5.')
 })
 
 export const Config: Schema<any> = Schema.object({
@@ -158,8 +171,9 @@ export const Config: Schema<any> = Schema.object({
     localFallback: Schema.boolean().default(true).description('没有 chatluna-storage-service 时，是否使用插件本地目录和 HTTP 路由兜底。'),
     localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
     localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。'),
-    expiredRetentionHours: Schema.number().min(1).max(24 * 365).default(24 * 3).description('原始直链检测失效后，缓存资源继续保留多少小时再清理。'),
-    cleanupIntervalHours: Schema.number().min(1).max(24 * 30).default(24).description('统一缓存清理间隔小时数。'),
+    expiredRetentionMinutes: Schema.number().min(1).max(24 * 365 * 60).default(5).description('原始直链检测失效后，缓存资源继续保留多少分钟再清理。默认 5 分钟。'),
+    cleanupIntervalMinutes: Schema.number().min(1).max(24 * 30 * 60).default(5).description('统一缓存清理间隔分钟数。默认 5 分钟。'),
+    livenessCheckBatchSize: Schema.number().min(1).max(100).default(12).description('每轮自动巡检最多检查多少条原始直链。用于控制网络开销。'),
     publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取资源的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景。'),
     webdavEnabled: Schema.boolean().default(false).description('是否同步到 WebDAV。'),
     webdavEndpoint: Schema.string().default('').description('WebDAV 根地址，例如 https://example.com/dav。'),
@@ -239,8 +253,11 @@ const DEFAULT_CONFIG: Config = {
     localDirectory: 'data/chatluna-image-resolver',
     localPublicPath: '/chatluna-image-resolver',
     retentionDays: 7,
-    expiredRetentionDays: 3,
-    cleanupIntervalHours: 24
+    expiredRetentionDays: 5 / 1440,
+    expiredRetentionMinutes: 5,
+    cleanupIntervalMinutes: 5,
+    livenessCheckBatchSize: 12,
+    cleanupIntervalHours: 5 / 60
   },
   delivery: {
     publicBaseUrl: ''
@@ -270,6 +287,11 @@ function compact<T extends Record<string, any>>(value: T): Partial<T> {
 function daysFromHours(hours: number | undefined, fallbackDays: number) {
   if (!Number.isFinite(Number(hours))) return fallbackDays
   return Math.max(1 / 24, Number(hours) / 24)
+}
+
+function daysFromMinutes(minutes: number | undefined, fallbackDays: number) {
+  if (!Number.isFinite(Number(minutes))) return fallbackDays
+  return Math.max(1 / 1440, Number(minutes) / 1440)
 }
 
 function parseServiceAccountJson(raw: unknown) {
@@ -392,7 +414,10 @@ export function normalizeConfig(input: any = {}): Config {
       localFallback: nested.storage.localFallback,
       localDirectory: nested.storage.localDirectory,
       localPublicPath: nested.storage.localPublicPath,
+      expiredRetentionMinutes: nested.storage.expiredRetentionMinutes,
       expiredRetentionHours: nested.storage.expiredRetentionHours,
+      cleanupIntervalMinutes: nested.storage.cleanupIntervalMinutes,
+      livenessCheckBatchSize: nested.storage.livenessCheckBatchSize,
       cleanupIntervalHours: nested.storage.cleanupIntervalHours
     })
   }
@@ -430,7 +455,20 @@ export function normalizeConfig(input: any = {}): Config {
   const legacyExpiredHours = Number.isFinite(Number(legacy.storage?.expiredRetentionDays))
     ? Number(legacy.storage.expiredRetentionDays) * 24
     : undefined
-  const expiredHours = Number(storageCache.expiredRetentionHours ?? legacyExpiredHours ?? DEFAULT_CONFIG.storage.expiredRetentionDays * 24)
+  const legacyExpiredMinutes = Number.isFinite(Number(legacy.storage?.expiredRetentionMinutes))
+    ? Number(legacy.storage.expiredRetentionMinutes)
+    : Number.isFinite(Number(legacyExpiredHours))
+      ? Number(legacyExpiredHours) * 60
+      : undefined
+  const expiredMinutes = Number(storageCache.expiredRetentionMinutes
+    ?? (Number.isFinite(Number(storageCache.expiredRetentionHours)) ? Number(storageCache.expiredRetentionHours) * 60 : undefined)
+    ?? legacyExpiredMinutes
+    ?? DEFAULT_CONFIG.storage.expiredRetentionMinutes)
+  const cleanupIntervalMinutes = Number(storageCache.cleanupIntervalMinutes
+    ?? (Number.isFinite(Number(storageCache.cleanupIntervalHours)) ? Number(storageCache.cleanupIntervalHours) * 60 : undefined)
+    ?? legacy.storage?.cleanupIntervalMinutes
+    ?? (Number.isFinite(Number(legacy.storage?.cleanupIntervalHours)) ? Number(legacy.storage.cleanupIntervalHours) * 60 : undefined)
+    ?? DEFAULT_CONFIG.storage.cleanupIntervalMinutes)
 
   return {
     credentials,
@@ -469,8 +507,11 @@ export function normalizeConfig(input: any = {}): Config {
       localDirectory: storageCache.localDirectory ?? legacy.storage?.localDirectory ?? DEFAULT_CONFIG.storage.localDirectory,
       localPublicPath: storageCache.localPublicPath ?? legacy.storage?.localPublicPath ?? DEFAULT_CONFIG.storage.localPublicPath,
       retentionDays: daysFromHours(ttlHours, legacy.storage?.retentionDays ?? DEFAULT_CONFIG.storage.retentionDays),
-      expiredRetentionDays: daysFromHours(expiredHours, legacy.storage?.expiredRetentionDays ?? DEFAULT_CONFIG.storage.expiredRetentionDays),
-      cleanupIntervalHours: storageCache.cleanupIntervalHours ?? legacy.storage?.cleanupIntervalHours ?? DEFAULT_CONFIG.storage.cleanupIntervalHours
+      expiredRetentionDays: daysFromMinutes(expiredMinutes, legacy.storage?.expiredRetentionDays ?? DEFAULT_CONFIG.storage.expiredRetentionDays),
+      expiredRetentionMinutes: Math.max(1, expiredMinutes),
+      cleanupIntervalMinutes: Math.max(1, cleanupIntervalMinutes),
+      livenessCheckBatchSize: Number(storageCache.livenessCheckBatchSize ?? legacy.storage?.livenessCheckBatchSize ?? DEFAULT_CONFIG.storage.livenessCheckBatchSize),
+      cleanupIntervalHours: Math.max(1 / 60, cleanupIntervalMinutes / 60)
     },
     delivery: merge(DEFAULT_CONFIG.delivery, legacy.delivery || storageDelivery),
     network: merge(DEFAULT_CONFIG.network, legacy.network || debuggingNetwork),
@@ -584,7 +625,7 @@ class QQMediaLinkResolverTool extends StructuredTool {
     const originalUrl = media.src
     const alive = await checkRemoteImageAlive(originalUrl, this.config)
     const publicUrl = isPublicHttpUrl(originalUrl)
-    const shouldCache = input.cache ?? this.config.qqMedia.cacheOnResolve
+    const shouldCache = input.cache ?? true
     const target = input.target ?? 'auto'
     let cachedUrl: string | undefined
     let cacheError: string | undefined
@@ -638,6 +679,7 @@ class QQMediaLinkResolverTool extends StructuredTool {
       kind: media.kind,
       originalUrl,
       cachedUrl,
+      primaryUrl: cachedUrl,
       originalUrlPublic: publicUrl,
       originalUrlAlive: alive,
       cached: Boolean(cachedUrl),
@@ -649,21 +691,77 @@ class QQMediaLinkResolverTool extends StructuredTool {
       textPreview,
       textTruncated,
       recommendations: media.kind === 'image' ? {
-        reverseSearch: publicUrl && alive.ok
-          ? 'Use originalUrl with image_reverse_search_resolve provider=auto or provider=serpapi-lens for QQ/Tencent CDN image URLs.'
-          : 'Use cachedUrl with image_reverse_search_resolve provider=auto when the original URL is private or not confirmed public.',
-        googleVision: cachedUrl || originalUrl
-          ? 'Google Vision uses credentials.googleClientEmail and credentials.googlePrivateKey, exchanges them for a short-lived OAuth token, and is useful only when the bot host can reach vision.googleapis.com and Koishi can download the image bytes.'
-          : 'No usable URL is available for Google Vision.',
+        reverseSearch: cachedUrl
+          ? 'Use cachedUrl with image_reverse_search_resolve provider=auto first. Only fall back to originalUrl if caching failed and the user explicitly needs reverse search.'
+          : 'Call this tool again with cache=true or explain that the media could not be cached before using originalUrl.',
+        googleVision: cachedUrl
+          ? 'Use cachedUrl for Google Vision because Koishi can fetch cached/local image bytes reliably.'
+          : 'No cached URL is available; avoid direct downstream media processing unless the user accepts original CDN instability.',
         chatluna: cachedUrl
           ? 'Use cachedUrl for local delivery and later cache inspection.'
-          : 'Use originalUrl only if the downstream consumer can fetch Tencent CDN URLs directly.'
+          : 'Do not treat originalUrl as the preferred processing URL; it is only diagnostic/fallback information.'
       } : undefined,
       note: media.kind === 'text'
         ? 'Text previews are bounded; use cachedUrl/originalUrl when the full file is needed.'
         : media.kind === 'image'
           ? 'This unified media tool replaces the old dedicated QQ image link tool. QQ/NapCat media URLs often reject HEAD but allow ranged/full GET.'
           : 'Media is cached only when this tool is called, so ordinary group traffic does not fill disk.'
+    }, null, 2)
+  }
+}
+
+class QQMediaCacheLookupTool extends StructuredTool {
+  name = 'qq_media_cache_lookup'
+  description = 'Looks up recent QQ/OneBot media message ids, original URLs, and existing managed cached URLs without downloading anything. Use this before qq_media_link_resolve when a user sends media.'
+  schema: any = QQ_MEDIA_CACHE_LOOKUP_SCHEMA
+
+  constructor(private ctx: Context, private config: Config, private tracker: QQImageTracker) {
+    super({})
+  }
+
+  async _call(input: z.infer<typeof QQ_MEDIA_CACHE_LOOKUP_SCHEMA>) {
+    const kind = input.kind ?? (typeof input.imageIndex === 'number' ? 'image' : undefined)
+    const mediaIndexInput = input.mediaIndex ?? input.imageIndex
+    const records = input.messageId
+      ? [this.tracker.findMedia(input.messageId, kind)?.record].filter(Boolean) as QQImageRecord[]
+      : this.tracker.listRecent(input.limit ?? 5)
+    const directory = join(this.ctx.baseDir, this.config.storage.localDirectory)
+    const items = []
+
+    for (const record of records) {
+      const candidates = kind ? record.media.filter((item) => item.kind === kind) : record.media
+      const selectedIndex = typeof mediaIndexInput === 'number'
+        ? clamp(mediaIndexInput, 0, Math.max(0, candidates.length - 1))
+        : undefined
+      const selected = typeof selectedIndex === 'number' ? candidates.slice(selectedIndex, selectedIndex + 1) : candidates
+      for (const media of selected) {
+        const cached = await findManagedCacheByOriginalUrl(directory, media.src).catch(() => undefined)
+        items.push({
+          messageId: record.messageId,
+          channelId: record.channelId,
+          guildId: record.guildId,
+          userId: record.userId,
+          kind: media.kind,
+          originalUrl: media.src,
+          cachedUrl: cached?.url,
+          primaryUrl: cached?.url,
+          cached: Boolean(cached?.url),
+          manifest: cached?.manifest,
+          filename: media.fileName || media.file,
+          mime: media.mime,
+          fileSize: media.fileSize,
+          duration: media.duration
+        })
+      }
+    }
+
+    return JSON.stringify({
+      ok: items.length > 0,
+      items,
+      cacheFirst: true,
+      hint: items.some((item) => item.cached)
+        ? 'Use primaryUrl/cachedUrl first. Only call qq_media_link_resolve for media without cachedUrl or when you need text preview/download.'
+        : 'No cached URL was found. Call qq_media_link_resolve with the messageId/mediaIndex to download and create a cachedUrl before further media processing.'
     }, null, 2)
   }
 }
@@ -687,6 +785,19 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
   }
 
   if (config.storage.localFallback) {
+    const runCacheMaintenance = async () => {
+      const directory = join(ctx.baseDir, config.storage.localDirectory)
+      await sweepManagedCacheOriginalUrls(directory, config, {
+        maxChecks: config.storage.livenessCheckBatchSize,
+        minCheckIntervalMinutes: config.storage.cleanupIntervalMinutes
+      })
+      await cleanupManagedImageCache(directory, {
+        retentionDays: config.storage.retentionDays,
+        expiredRetentionDays: config.storage.expiredRetentionDays,
+        expiredRetentionMinutes: config.storage.expiredRetentionMinutes
+      })
+    }
+
     ctx.inject(['server'], (ctx2) => {
       if (!ctx2.server) return
       ctx2.server.get(`${config.storage.localPublicPath}/_cache`, async (koa) => {
@@ -744,17 +855,11 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
       })
     })
     ctx.on('ready', () => {
-      void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
-        retentionDays: config.storage.retentionDays,
-        expiredRetentionDays: config.storage.expiredRetentionDays
-      }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
+      void runCacheMaintenance().catch((error) => ctx.logger(name).warn('media cache maintenance failed: %s', formatError(error)))
     })
     ctx.setInterval?.(() => {
-      void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
-        retentionDays: config.storage.retentionDays,
-        expiredRetentionDays: config.storage.expiredRetentionDays
-      }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
-    }, Math.max(1, config.storage.cleanupIntervalHours) * 60 * 60 * 1000)
+      void runCacheMaintenance().catch((error) => ctx.logger(name).warn('media cache maintenance failed: %s', formatError(error)))
+    }, Math.max(1, config.storage.cleanupIntervalMinutes) * 60 * 1000)
   }
 
   const registerTool = (ctx2: Context) => {
@@ -814,6 +919,28 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
     }
 
     if (config.qqMedia.enabled) {
+      ctx2.effect(() => ctx2.chatluna.platform.registerTool('qq_media_cache_lookup', {
+        description: 'Look up recent QQ/OneBot media message ids and existing cached URLs before downloading or processing media.',
+        selector() {
+          return true
+        },
+        createTool() {
+          return new QQMediaCacheLookupTool(ctx2, config, qqMediaTracker)
+        },
+        meta: {
+          source: 'extension',
+          group: 'image-resolver',
+          tags: ['image-resolver', 'qq-media', 'cache-lookup'],
+          defaultAvailability: {
+            enabled: true,
+            main: true,
+            chatluna: true,
+            characterScope: 'all'
+          }
+        }
+      }))
+      ctx2.logger(name).info('registered ChatLuna QQ media cache lookup tool: qq_media_cache_lookup')
+
       const qqMediaToolName = config.qqMedia.toolName.trim() || 'qq_media_link_resolve'
       ctx2.effect(() => ctx2.chatluna.platform.registerTool(qqMediaToolName, {
         description: config.qqMedia.description,

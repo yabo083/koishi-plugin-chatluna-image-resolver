@@ -3,6 +3,7 @@ import type { Config, TrackedMediaKind, WebDavConfig } from './types';
 export declare function cleanupManagedImageCache(directory: string, options: {
     retentionDays: number;
     expiredRetentionDays?: number;
+    expiredRetentionMinutes?: number;
     now?: number;
 }): Promise<{
     scanned: number;
@@ -10,8 +11,20 @@ export declare function cleanupManagedImageCache(directory: string, options: {
     skipped: number;
 }>;
 export declare function markManagedCacheEntryExpired(directory: string, manifestName: string, check: Record<string, unknown>, now?: number): Promise<any>;
+export declare function markManagedCacheEntryChecked(directory: string, manifestName: string, check: Record<string, unknown>, now?: number): Promise<any>;
 export declare function listManagedImageCache(directory: string): Promise<{
     items: any[];
+}>;
+export declare function findManagedCacheByOriginalUrl(directory: string, originalUrl: string): Promise<any>;
+export declare function sweepManagedCacheOriginalUrls(directory: string, config: Config, options?: {
+    maxChecks?: number;
+    minCheckIntervalMinutes?: number;
+    now?: number;
+}): Promise<{
+    checked: number;
+    expired: number;
+    refreshed: number;
+    remaining: number;
 }>;
 export declare function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>): Promise<{
     ok: boolean;

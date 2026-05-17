@@ -7,7 +7,7 @@ export declare const inject: {
 export type Config = ResolverConfig;
 export type { ConfigInput };
 export type { TrackedMediaKind, WebDavConfig } from './types';
-export { checkRemoteImageAlive, cleanupManagedImageCache, isManagedCacheFilename, listManagedImageCache, markManagedCacheEntryExpired, storeManagedAsset } from './cache';
+export { checkRemoteImageAlive, cleanupManagedImageCache, findManagedCacheByOriginalUrl, isManagedCacheFilename, listManagedImageCache, markManagedCacheEntryChecked, markManagedCacheEntryExpired, sweepManagedCacheOriginalUrls, storeManagedAsset } from './cache';
 export { buildGoogleVisionWebDetectionRequest, buildGoogleVisionWebDetectionUriRequest, buildSerpApiGoogleLensUrl, buildSerpApiImagesUrl, buildSerpApiReverseImageUrl, detectManagedAssetKind, isPublicHttpUrl, mimeFromFilename, rewriteImageUrlForPublicAccess, rewriteUrlBase, serpApiImagesToCandidates, serpApiLensPayloadToResult, serpApiReversePayloadToResult } from './utils';
 export { selectReverseProvider } from './resolvers';
 export declare const Config: Schema<any>;

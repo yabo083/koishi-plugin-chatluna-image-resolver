@@ -18,6 +18,7 @@ const {
   rewriteImageUrlForPublicAccess,
   selectReverseProvider,
   serpApiLensPayloadToResult,
+  sweepManagedCacheOriginalUrls,
   storeManagedAsset
 } = require('../lib/index.js')
 
@@ -295,6 +296,92 @@ test('marks expired original URLs in manifests and removes them after the expire
   assert.equal(summary.deleted, 2)
   await assert.rejects(() => stat(image))
   await assert.rejects(() => stat(manifest))
+})
+
+test('removes expired original URLs after a five minute retention window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'media-resolver-expired-minutes-'))
+  const image = join(root, 'resolved-image-stale.jpg')
+  const manifest = join(root, 'resolved-image-stale.jpg.json')
+  await writeFile(image, 'image')
+  await writeFile(manifest, JSON.stringify({
+    filename: 'resolved-image-stale.jpg',
+    url: '/chatluna-image-resolver/resolved-image-stale.jpg',
+    originalUrl: 'https://cdn.example.test/stale.jpg',
+    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
+  }, null, 2))
+
+  await markManagedCacheEntryExpired(root, 'resolved-image-stale.jpg.json', {
+    ok: false,
+    status: 404
+  }, Date.parse('2026-05-10T00:00:00.000Z'))
+
+  const early = await cleanupManagedImageCache(root, {
+    retentionDays: 30,
+    expiredRetentionMinutes: 5,
+    now: Date.parse('2026-05-10T00:04:59.000Z')
+  })
+  assert.equal(early.deleted, 0)
+
+  const late = await cleanupManagedImageCache(root, {
+    retentionDays: 30,
+    expiredRetentionMinutes: 5,
+    now: Date.parse('2026-05-10T00:05:00.000Z')
+  })
+  assert.equal(late.deleted, 2)
+  await assert.rejects(() => stat(image))
+  await assert.rejects(() => stat(manifest))
+})
+
+test('sweeps original URLs in bounded batches and marks dead cache entries', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'media-resolver-sweep-'))
+  await writeFile(join(root, 'resolved-image-a.jpg'), 'image')
+  await writeFile(join(root, 'resolved-image-a.jpg.json'), JSON.stringify({
+    filename: 'resolved-image-a.jpg',
+    url: '/chatluna-image-resolver/resolved-image-a.jpg',
+    originalUrl: 'https://cdn.example.test/a.jpg',
+    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
+  }, null, 2))
+  await writeFile(join(root, 'resolved-image-b.jpg'), 'image')
+  await writeFile(join(root, 'resolved-image-b.jpg.json'), JSON.stringify({
+    filename: 'resolved-image-b.jpg',
+    url: '/chatluna-image-resolver/resolved-image-b.jpg',
+    originalUrl: 'https://cdn.example.test/b.jpg',
+    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
+  }, null, 2))
+
+  const oldFetch = global.fetch
+  const calls = []
+  global.fetch = async (url) => {
+    calls.push(String(url))
+    return {
+      ok: false,
+      status: 404,
+      headers: new Map(),
+      arrayBuffer: async () => new ArrayBuffer(0),
+      json: async () => ({})
+    }
+  }
+  try {
+    const summary = await sweepManagedCacheOriginalUrls(root, {
+      search: { pageTimeoutMs: 1000 },
+      image: { userAgent: 'test' },
+      storage: { livenessCheckBatchSize: 1, cleanupIntervalMinutes: 5 }
+    }, {
+      maxChecks: 1,
+      minCheckIntervalMinutes: 5,
+      now: Date.parse('2026-05-10T00:10:00.000Z')
+    })
+
+    assert.equal(summary.checked, 1)
+    assert.equal(summary.expired, 1)
+    assert.equal(calls.length, 2)
+    const first = JSON.parse(await readFile(join(root, 'resolved-image-a.jpg.json'), 'utf8'))
+    const second = JSON.parse(await readFile(join(root, 'resolved-image-b.jpg.json'), 'utf8'))
+    assert.equal(first.originalUrlExpired, true)
+    assert.equal(second.originalUrlExpired, undefined)
+  } finally {
+    global.fetch = oldFetch
+  }
 })
 
 test('writes a visible manifest when storing through ChatLuna storage', async () => {

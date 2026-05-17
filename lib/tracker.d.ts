@@ -8,4 +8,5 @@ export declare class QQImageTracker {
     findMedia(messageId?: string, kind?: TrackedMediaKind): {
         record: QQImageRecord;
     } | undefined;
+    listRecent(limit?: number): QQImageRecord[];
 }

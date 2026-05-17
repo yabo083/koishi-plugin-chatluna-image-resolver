@@ -67,6 +67,9 @@ export interface Config {
     localPublicPath: string
     retentionDays: number
     expiredRetentionDays: number
+    expiredRetentionMinutes: number
+    cleanupIntervalMinutes: number
+    livenessCheckBatchSize: number
     cleanupIntervalHours: number
   }
   delivery: {
@@ -136,7 +139,10 @@ export interface ConfigInput {
       localFallback?: boolean
       localDirectory?: string
       localPublicPath?: string
+      expiredRetentionMinutes?: number
       expiredRetentionHours?: number
+      cleanupIntervalMinutes?: number
+      livenessCheckBatchSize?: number
       cleanupIntervalHours?: number
     }
     delivery?: Partial<Config['delivery']>
@@ -145,7 +151,10 @@ export interface ConfigInput {
     localFallback?: boolean
     localDirectory?: string
     localPublicPath?: string
+    expiredRetentionMinutes?: number
     expiredRetentionHours?: number
+    cleanupIntervalMinutes?: number
+    livenessCheckBatchSize?: number
     cleanupIntervalHours?: number
     publicBaseUrl?: string
     webdavEnabled?: boolean

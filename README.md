@@ -8,10 +8,11 @@ Miyako ChatLuna 媒体/文件解析工具插件。
 
 ## ChatLuna 工具
 
-默认注册三个工具：
+默认注册四个工具：
 
 - `image_search_resolve`：以文搜图，下载候选图片并转存为 Koishi 可访问 URL。
 - `image_reverse_search_resolve`：以图搜图，默认 `provider: auto`，按 URL 可达性自动选择 Google Vision 或 SerpApi Google Lens。
+- `qq_media_cache_lookup`：查询最近 QQ/OneBot 媒体消息、消息 ID、原始直链与已有缓存映射，不下载文件。角色预设应先调用它，命中时直接使用 `cachedUrl` / `primaryUrl`。
 - `qq_media_link_resolve`：统一的 QQ 媒体/文件直链解析工具，支持图片、语音/音频、常见文本文件和普通附件；文本文件可返回受限长度预览。旧图片工具的 `imageIndex` 入参可继续作为兼容别名使用。
 
 ## 以文搜图
@@ -41,12 +42,16 @@ Google Vision REST 请求遵循官方 `POST https://vision.googleapis.com/v1/ima
 
 NapCat 的 OneBot 图片、语音和文件段通常包含腾讯 CDN `url`。Koishi onebot 适配器会把图片转换为 `img` 元素的 `src`，语音/文件也会保留在消息元素属性里。插件只在内存中保留最近含媒体消息的轻量索引，不会在每次收到资源时落盘。
 
-当 ChatLuna 需要读取 QQ 群图片、语音或文本文件时，调用 `qq_media_link_resolve`：
+当 ChatLuna 需要读取 QQ 群图片、语音或文本文件时，先调用 `qq_media_cache_lookup`：
+
+- 如果已有 `cachedUrl` / `primaryUrl`，后续读取、识图、反搜和回复都优先使用缓存链接。
+- 如果没有命中缓存，再调用 `qq_media_link_resolve` 下载并创建缓存。
+- `qq_media_link_resolve` 的 `originalUrl` 只作为诊断/兜底信息，不应作为 ChatLuna 的首选处理链接。
 
 - 可传入 `messageId`，也可省略并使用最近一条含媒体消息。
 - 可传入 `kind: "image" | "audio" | "text" | "file"` 过滤资源类型。
 - 图片场景可传入 `mediaIndex`，也可继续传旧字段 `imageIndex` 作为兼容别名。
-- 工具会返回 `originalUrl`、公网/可下载检测结果、按需缓存后的 `cachedUrl`，以及针对 SerpApi、Google Vision、ChatLuna 本地发送的使用建议。
+- 工具会返回 `originalUrl`、公网/可下载检测结果、按需缓存后的 `cachedUrl` / `primaryUrl`，以及针对 SerpApi、Google Vision、ChatLuna 本地发送的使用建议。
 - 默认 `cacheOnResolve: true`，只有工具被调用时才下载并进入 7 天缓存管理，避免群里每张图片都占用磁盘。
 - QQ 原始腾讯 CDN 直链不应默认交给 `google_reverse_image`；实际反搜优先用 `image_reverse_search_resolve` 的 `provider: "auto"` 或 `provider: "serpapi-lens"`。
 
@@ -91,7 +96,7 @@ miyako-chatluna-media-resolver:
 
 ## 缓存管理
 
-受管缓存使用统一 TTL：`storage.ttlHours` 同时控制 ChatLuna Storage 临时文件过期时间和本地兜底缓存 manifest 的保留天数。默认 168 小时。原始直链失效后的宽限期使用 `storage.expiredRetentionHours`，默认 72 小时。
+受管缓存使用统一 TTL：`storage.ttlHours` 同时控制 ChatLuna Storage 临时文件过期时间和本地兜底缓存 manifest 的保留天数。默认 168 小时。原始直链失效后的宽限期使用 `storage.expiredRetentionMinutes`，默认 5 分钟；清理任务默认每 5 分钟运行一次。
 
 本地兜底缓存默认写入 `data/chatluna-image-resolver`，并按统一缓存策略定时清理过期的受管资源和 manifest。
 
@@ -103,7 +108,7 @@ miyako-chatluna-media-resolver:
 - MIME、字节数、创建时间和保留天数。
 - 原始直链最近一次检测结果；当直链检测失效时，manifest 会标记 `originalUrlExpired` 和 `originalUrlExpiredAt`。
 
-启用 Koishi console 后，插件详情页会显示资源缓存面板，可按全部/图片/语音/文本/文件筛选，查看总量、最近写入、资源元数据，并逐条检测原始直链是否仍可访问。检测失败的直链会被标为已过期，并按 `storage.expiredRetentionHours` 继续保留一段时间后由定时清理删除，避免长期保留不可追溯的失效热链。
+启用 Koishi console 后，插件详情页会显示资源缓存面板，可按全部/图片/语音/文本/文件筛选，查看总量、最近写入、资源元数据，并逐条检测原始直链是否仍可访问。后台也会按 `storage.cleanupIntervalMinutes` 自动分批巡检 manifest 中的原始直链，每轮最多检查 `storage.livenessCheckBatchSize` 条，避免大量缓存时集中打爆网络。检测失败的直链会被标为已过期，并按 `storage.expiredRetentionMinutes` 继续保留一段时间后由定时清理删除；默认 5 分钟后删除，避免长期保留不可追溯的失效热链。
 
 ## HTTP 请求
 

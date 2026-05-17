@@ -75,8 +75,8 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
         localFallback: true,
         localDirectory: 'cache-dir',
         localPublicPath: '/media-cache',
-        expiredRetentionHours: 12,
-        cleanupIntervalHours: 6
+        expiredRetentionMinutes: 5,
+        cleanupIntervalMinutes: 5
       },
       delivery: { publicBaseUrl: 'https://bot.example.test' }
     },
@@ -98,7 +98,9 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
   assert.equal(nested.search.serpApiKey, 'serp-text')
   assert.equal(nested.image.tempExpireHours, 72)
   assert.equal(nested.storage.retentionDays, 3)
-  assert.equal(nested.storage.expiredRetentionDays, 0.5)
+  assert.equal(nested.storage.expiredRetentionDays, 5 / 1440)
+  assert.equal(nested.storage.expiredRetentionMinutes, 5)
+  assert.equal(nested.storage.cleanupIntervalMinutes, 5)
   assert.equal(nested.storage.localPublicPath, '/media-cache')
   assert.equal(nested.delivery.publicBaseUrl, 'https://bot.example.test')
   assert.equal(nested.image.userAgent, 'TestAgent')

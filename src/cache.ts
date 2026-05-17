@@ -19,10 +19,13 @@ import {
 
 const loggerName = 'miyako-chatluna-media-resolver'
 
-export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; expiredRetentionDays?: number; now?: number }) {
+export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; expiredRetentionDays?: number; expiredRetentionMinutes?: number; now?: number }) {
   const now = options.now ?? Date.now()
   const cutoff = now - Math.max(1, options.retentionDays) * 24 * 60 * 60 * 1000
-  const expiredCutoff = now - Math.max(1, options.expiredRetentionDays ?? options.retentionDays) * 24 * 60 * 60 * 1000
+  const expiredRetentionMs = Number.isFinite(Number(options.expiredRetentionMinutes))
+    ? Math.max(1, Number(options.expiredRetentionMinutes)) * 60 * 1000
+    : Math.max(1 / 1440, options.expiredRetentionDays ?? options.retentionDays) * 24 * 60 * 60 * 1000
+  const expiredCutoff = now - expiredRetentionMs
   let deleted = 0
   let scanned = 0
   let skipped = 0
@@ -84,6 +87,29 @@ export async function markManagedCacheEntryExpired(directory: string, manifestNa
   return next
 }
 
+export async function markManagedCacheEntryChecked(directory: string, manifestName: string, check: Record<string, unknown>, now = Date.now()) {
+  if (!isManagedCacheFilename(manifestName) || !manifestName.endsWith('.json')) {
+    throw new Error('invalid managed manifest name')
+  }
+  const file = join(directory, manifestName)
+  const manifest = await readManifest(file)
+  if (!manifest) throw new Error('managed manifest not found or invalid')
+  const expired = check?.ok === false
+  const next = {
+    ...manifest,
+    originalUrlExpired: expired ? true : false,
+    originalUrlExpiredAt: expired
+      ? manifest.originalUrlExpiredAt || new Date(now).toISOString()
+      : undefined,
+    originalUrlLastCheck: {
+      ...check,
+      checkedAt: new Date(now).toISOString()
+    }
+  }
+  await writeFile(file, JSON.stringify(next, null, 2))
+  return next
+}
+
 export async function listManagedImageCache(directory: string) {
   let entries: string[] = []
   try {
@@ -108,6 +134,51 @@ export async function listManagedImageCache(directory: string) {
     }
   }
   return { items }
+}
+
+export async function findManagedCacheByOriginalUrl(directory: string, originalUrl: string) {
+  if (!originalUrl) return undefined
+  const { items } = await listManagedImageCache(directory)
+  return items.find((item) => item.originalUrl === originalUrl && item.url && !item.originalUrlExpired)
+}
+
+export async function sweepManagedCacheOriginalUrls(
+  directory: string,
+  config: Config,
+  options: { maxChecks?: number; minCheckIntervalMinutes?: number; now?: number } = {}
+) {
+  const now = options.now ?? Date.now()
+  const maxChecks = Math.max(1, Math.floor(options.maxChecks ?? config.storage.livenessCheckBatchSize ?? 12))
+  const minCheckIntervalMs = Math.max(1, options.minCheckIntervalMinutes ?? config.storage.cleanupIntervalMinutes ?? 5) * 60 * 1000
+  const { items } = await listManagedImageCache(directory)
+  const candidates = items
+    .filter((item) => item.manifest && item.originalUrl && !item.originalUrlExpired)
+    .filter((item) => {
+      const checkedAt = item.originalUrlLastCheck?.checkedAt ? Date.parse(item.originalUrlLastCheck.checkedAt) : 0
+      return !checkedAt || checkedAt <= now - minCheckIntervalMs
+    })
+    .sort((a, b) => {
+      const aTime = a.originalUrlLastCheck?.checkedAt ? Date.parse(a.originalUrlLastCheck.checkedAt) : 0
+      const bTime = b.originalUrlLastCheck?.checkedAt ? Date.parse(b.originalUrlLastCheck.checkedAt) : 0
+      return aTime - bTime
+    })
+    .slice(0, maxChecks)
+
+  let checked = 0
+  let expired = 0
+  let refreshed = 0
+  for (const item of candidates) {
+    const result = await checkRemoteImageAlive(String(item.originalUrl), config)
+    checked++
+    if (result.ok === false) {
+      await markManagedCacheEntryExpired(directory, item.manifest, result, now)
+      expired++
+    } else {
+      await markManagedCacheEntryChecked(directory, item.manifest, result, now)
+      refreshed++
+    }
+  }
+  return { checked, expired, refreshed, remaining: Math.max(0, items.length - candidates.length) }
 }
 
 export async function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>) {

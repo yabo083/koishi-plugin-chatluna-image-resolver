@@ -57,4 +57,8 @@ export class QQImageTracker {
       if (hasKind(record)) return { record }
     }
   }
+
+  listRecent(limit = 20) {
+    return this.records.slice(-Math.max(1, limit)).reverse()
+  }
 }
