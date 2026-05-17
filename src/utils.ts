@@ -1,4 +1,5 @@
 import { extname } from 'node:path'
+import { createRequire } from 'node:module'
 import type {
   Config,
   GoogleReverseResult,
@@ -9,6 +10,9 @@ import type {
   TrackedMediaKind,
   WebDetection
 } from './types'
+
+const nodeRequire = createRequire(__filename)
+let configuredProxy = ''
 
 export interface SerpApiImagesUrlOptions {
   apiKey: string
@@ -57,6 +61,26 @@ export function buildGoogleVisionWebDetectionRequest(buffer: Buffer, maxResults:
       {
         image: {
           content: buffer.toString('base64')
+        },
+        features: [
+          {
+            type: 'WEB_DETECTION',
+            maxResults: clamp(Math.floor(maxResults), 1, 50)
+          }
+        ]
+      }
+    ]
+  }
+}
+
+export function buildGoogleVisionWebDetectionUriRequest(imageUri: string, maxResults: number) {
+  return {
+    requests: [
+      {
+        image: {
+          source: {
+            imageUri
+          }
         },
         features: [
           {
@@ -246,12 +270,35 @@ export function scoreCandidate(candidate: ImageCandidate, config: Config, safeMo
 }
 
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+  configureFetchProxy()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timer)
+  }
+}
+
+export function configureFetchProxy(proxyOverride?: string) {
+  const proxy = proxyOverride?.trim()
+    || process.env.HTTPS_PROXY
+    || process.env.HTTP_PROXY
+    || process.env.https_proxy
+    || process.env.http_proxy
+  if (!proxy) return
+  if (configuredProxy === proxy) return
+  try {
+    const undici = nodeRequire('undici') as {
+      ProxyAgent?: new (url: string) => unknown
+      setGlobalDispatcher?: (dispatcher: unknown) => void
+    }
+    if (undici.ProxyAgent && undici.setGlobalDispatcher) {
+      undici.setGlobalDispatcher(new undici.ProxyAgent(proxy))
+      configuredProxy = proxy
+    }
+  } catch {
+    // Keep native fetch behavior when undici is unavailable.
   }
 }
 

@@ -21,6 +21,19 @@ export declare function buildGoogleVisionWebDetectionRequest(buffer: Buffer, max
         }[];
     }[];
 };
+export declare function buildGoogleVisionWebDetectionUriRequest(imageUri: string, maxResults: number): {
+    requests: {
+        image: {
+            source: {
+                imageUri: string;
+            };
+        };
+        features: {
+            type: string;
+            maxResults: number;
+        }[];
+    }[];
+};
 export declare function buildSerpApiReverseImageUrl(options: {
     apiKey: string;
     imageUrl: string;
@@ -45,6 +58,7 @@ export declare function pushCandidate(out: ImageCandidate[], value: string, page
 export declare function candidatesFromRawImage(raw: any, pageUrl: string): ImageCandidate[];
 export declare function scoreCandidate(candidate: ImageCandidate, config: Config, safeMode: boolean): ImageCandidate;
 export declare function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response>;
+export declare function configureFetchProxy(proxyOverride?: string): void;
 export declare function decodeDuckUrl(url: string): string;
 export declare function absolutizeUrl(raw: string, base: string): string;
 export declare function normalizeImageUrl(url: string): string;

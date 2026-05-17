@@ -6,12 +6,14 @@ const test = require('node:test')
 
 const {
   buildGoogleVisionWebDetectionRequest,
+  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiReverseImageUrl,
   cleanupManagedImageCache,
   detectManagedAssetKind,
   isPublicHttpUrl,
   isManagedCacheFilename,
+  markManagedCacheEntryExpired,
   mimeFromFilename,
   rewriteImageUrlForPublicAccess,
   selectReverseProvider,
@@ -32,6 +34,28 @@ test('builds Google Vision web detection request with downloaded image bytes as 
           {
             type: 'WEB_DETECTION',
             maxResults: 7
+          }
+        ]
+      }
+    ]
+  })
+})
+
+test('builds Google Vision web detection request with a public image URI', () => {
+  const body = buildGoogleVisionWebDetectionUriRequest('https://example.test/image.jpg', 3)
+
+  assert.deepEqual(body, {
+    requests: [
+      {
+        image: {
+          source: {
+            imageUri: 'https://example.test/image.jpg'
+          }
+        },
+        features: [
+          {
+            type: 'WEB_DETECTION',
+            maxResults: 3
           }
         ]
       }
@@ -235,6 +259,42 @@ test('cleans managed media cache artifacts older than retention window', async (
   await assert.rejects(() => stat(oldTextManifest))
   assert.equal(await readFile(freshPdf, 'utf8'), 'fresh-pdf')
   assert.equal(await readFile(unmanagedOld, 'utf8'), 'manual')
+})
+
+test('marks expired original URLs in manifests and removes them after the expired retention window', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'media-resolver-expired-'))
+  await mkdir(root, { recursive: true })
+  const image = join(root, 'resolved-image-dead.jpg')
+  const manifest = join(root, 'resolved-image-dead.jpg.json')
+  await writeFile(image, 'image')
+  await writeFile(manifest, JSON.stringify({
+    filename: 'resolved-image-dead.jpg',
+    url: '/chatluna-image-resolver/resolved-image-dead.jpg',
+    originalUrl: 'https://cdn.example.test/dead.jpg',
+    createdAt: new Date('2026-05-01T00:00:00.000Z').toISOString()
+  }, null, 2))
+
+  await markManagedCacheEntryExpired(root, 'resolved-image-dead.jpg.json', {
+    ok: false,
+    status: 404,
+    error: 'not found'
+  }, Date.parse('2026-05-10T00:00:00.000Z'))
+
+  const updated = JSON.parse(await readFile(manifest, 'utf8'))
+  assert.equal(updated.originalUrlExpired, true)
+  assert.equal(updated.originalUrlLastCheck.ok, false)
+  assert.equal(updated.originalUrlLastCheck.status, 404)
+  assert.equal(updated.originalUrlExpiredAt, '2026-05-10T00:00:00.000Z')
+
+  const summary = await cleanupManagedImageCache(root, {
+    retentionDays: 30,
+    expiredRetentionDays: 1,
+    now: Date.parse('2026-05-12T00:00:00.000Z')
+  })
+
+  assert.equal(summary.deleted, 2)
+  await assert.rejects(() => stat(image))
+  await assert.rejects(() => stat(manifest))
 })
 
 test('writes a visible manifest when storing through ChatLuna storage', async () => {

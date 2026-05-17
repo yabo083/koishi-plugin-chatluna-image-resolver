@@ -5,10 +5,10 @@ import { readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type {
   Config as ResolverConfig,
+  ConfigInput,
   GoogleReverseResult,
   ImageCandidate,
   QQImageRecord,
-  SearchResult,
   SerpApiLensResult,
   SerpApiReverseResult,
   StoredImage,
@@ -17,22 +17,25 @@ import type {
   WebDavConfig,
   WebDetection
 } from './types'
-import { ImageResolver, ReverseImageResolver, selectReverseProvider } from './resolvers'
+import { diagnoseGoogleVision, ImageResolver, ReverseImageResolver, selectReverseProvider } from './resolvers'
 import { QQImageTracker } from './tracker'
 import {
   checkRemoteImageAlive,
   cleanupManagedImageCache,
   downloadMediaFromUrl,
   listManagedImageCache,
+  markManagedCacheEntryExpired,
   readJsonBody,
   storeManagedAsset
 } from './cache'
 import {
   buildGoogleVisionWebDetectionRequest,
+  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
   buildSerpApiReverseImageUrl,
   clamp,
+  configureFetchProxy,
   detectManagedAssetKind,
   formatError,
   isPublicHttpUrl,
@@ -46,19 +49,22 @@ import {
 } from './utils'
 
 export const name = 'miyako-chatluna-media-resolver'
-export const inject = { optional: ['chatluna', 'chatluna_storage', 'puppeteer', 'server', 'console'] as const }
+export const inject = { optional: ['chatluna', 'chatluna_storage', 'server', 'console'] as const }
 
 export type Config = ResolverConfig
+export type { ConfigInput }
 export type { TrackedMediaKind, WebDavConfig } from './types'
 export {
   checkRemoteImageAlive,
   cleanupManagedImageCache,
   isManagedCacheFilename,
   listManagedImageCache,
+  markManagedCacheEntryExpired,
   storeManagedAsset
 } from './cache'
 export {
   buildGoogleVisionWebDetectionRequest,
+  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
   buildSerpApiReverseImageUrl,
@@ -80,8 +86,8 @@ const TOOL_SCHEMA = z.object({
 })
 
 const REVERSE_TOOL_SCHEMA = z.object({
-  imageUrl: z.string().url().describe('Image URL to reverse search. Google downloads it and sends base64 bytes; SerpApi URL-based providers require a public URL.'),
-  provider: z.enum(['auto', 'serpapi', 'serpapi-lens', 'google']).optional().describe('Override the configured reverse-search provider for this call. Auto chooses Google for private/local URLs and Google Lens for public QQ/Tencent CDN URLs.'),
+  imageUrl: z.string().url().describe('Image URL to reverse search. Google Vision uses service-account OAuth and downloaded image bytes; SerpApi URL-based providers require a public URL.'),
+  provider: z.enum(['auto', 'serpapi', 'serpapi-lens', 'google']).optional().describe('Override the configured reverse-search provider for this call. Auto chooses Google Vision for private/local URLs only when service-account credentials are configured, otherwise SerpApi Google Lens for public URLs.'),
   maxResults: z.number().int().min(1).max(50).optional().describe('Maximum reverse-search results. Defaults to the plugin config.')
 })
 
@@ -96,108 +102,386 @@ const QQ_MEDIA_TOOL_SCHEMA = z.object({
   maxTextBytes: z.number().int().min(256).max(262144).optional().describe('Maximum bytes to include in text preview. Defaults to plugin config.')
 })
 
-export const Config: Schema<Config> = Schema.intersect([
-  Schema.object({
-    tool: Schema.object({
-      enabled: Schema.boolean().default(true).description('是否注册 ChatLuna 工具。'),
-      name: Schema.string().default('image_search_resolve').description('ChatLuna 工具名称。'),
-      description: Schema.string().role('textarea').default('Searches for images, extracts real image candidates, downloads them with browser-like headers, stores them as Koishi-accessible URLs, and returns ready-to-send image links. Use this instead of sending remote hotlink URLs directly.').description('工具描述。')
-    }).description('工具')
-  }),
-  Schema.object({
-    search: Schema.object({
-      provider: Schema.union([
-        Schema.const('serpapi').description('SerpApi Google Images，直接返回原图候选。'),
-        Schema.const('serpapi-fallback').description('优先 SerpApi Google Images，不足时回退到 Tavily/DuckDuckGo 网页解析。'),
-        Schema.const('duckduckgo').description('DuckDuckGo HTML/Lite 搜索。'),
-        Schema.const('tavily').description('Tavily 搜索。'),
-        Schema.const('both').description('先 Tavily 后 DuckDuckGo。')
-      ]).default('serpapi').description('搜索提供方。'),
-      serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key。provider 为 SerpApi 时必填。'),
-      serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain；留空则使用默认。'),
-      serpApiGl: Schema.string().default('cn').description('SerpApi gl 地区参数。'),
-      serpApiHl: Schema.string().default('zh-cn').description('SerpApi hl 语言参数。'),
-      serpApiSafe: Schema.union([
-        Schema.const('active').description('开启 Google SafeSearch。'),
-        Schema.const('off').description('关闭 Google SafeSearch。')
-      ]).default('active').description('SerpApi safe 参数。'),
-      tavilyApiKey: Schema.string().role('secret').default('').description('Tavily API Key，留空则跳过 Tavily。'),
-      maxSearchResults: Schema.number().min(1).max(100).default(12).description('最多读取多少条搜索结果。'),
-      maxPages: Schema.number().min(1).max(8).default(4).description('最多打开多少个候选页面。'),
-      pageTimeoutMs: Schema.number().min(3000).max(60000).default(12000).description('页面抓取/下载超时。'),
-      usePuppeteerFallback: Schema.boolean().default(true).description('普通 HTML 抓不到图片时，是否用 Puppeteer 读取 DOM 图片。')
-    }).description('搜索')
-  }),
-  Schema.object({
-    image: Schema.object({
-      maxCount: Schema.number().min(1).max(8).default(4).description('单次最多返回图片数。'),
-      maxDownloadBytes: Schema.number().min(100000).max(20000000).default(8000000).description('单张图片最大下载字节数。'),
-      minWidth: Schema.number().min(1).max(4000).default(220).description('候选图片最小宽度。'),
-      minHeight: Schema.number().min(1).max(4000).default(220).description('候选图片最小高度。'),
-      tempExpireHours: Schema.number().min(1).max(24 * 365).default(24 * 7).description('转存到 ChatLuna Storage 的过期小时数。默认 7 天。'),
-      userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36').description('下载图片时使用的 User-Agent。')
-    }).description('图片')
-  }),
-  Schema.object({
-    reverse: Schema.object({
-      enabled: Schema.boolean().default(true).description('是否注册以图搜图 ChatLuna 工具。'),
-      toolName: Schema.string().default('image_reverse_search_resolve').description('以图搜图工具名称。'),
-      description: Schema.string().role('textarea').default('Reverse-searches an image with automatic provider selection: Google Vision for private/local images that require base64 bytes, and SerpApi Google Lens for public QQ/Tencent CDN image URLs.').description('以图搜图工具描述。'),
-      provider: Schema.union([
-        Schema.const('auto').description('自动选择：私有/本地 URL 且配置了 Google Key 时走 Google Vision；公网 QQ/Tencent CDN 图片优先走 SerpApi Google Lens。'),
-        Schema.const('serpapi').description('SerpApi Google Reverse Image API，使用 image_url。'),
-        Schema.const('serpapi-lens').description('SerpApi Google Lens API，使用 url，适合 QQ/NapCat 原始图片 CDN 链接。'),
-        Schema.const('google').description('Google Cloud Vision Web Detection，插件会下载图片并转为 base64。')
-      ]).default('auto').description('以图搜图提供方。'),
-      serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key；留空则复用搜索配置中的 SerpApi Key。'),
-      serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain。'),
-      googleApiKey: Schema.string().role('secret').default('').description('Google Cloud Vision API Key。'),
-      maxResults: Schema.number().min(1).max(50).default(10).description('最大反搜结果数。'),
-      publicBaseUrl: Schema.string().default('').description('公网 Koishi 根地址；SerpApi 需要公网 URL 时用于改写 ChatLuna/本地缓存链接。'),
-      customPrompt: Schema.string().role('textarea').default('').description('附加到以图搜图工具结果中的模型提示。')
-    }).description('以图搜图')
-  }),
-  Schema.object({
-    qqMedia: Schema.object({
-      enabled: Schema.boolean().default(true).description('是否注册 QQ 媒体/文件解析工具。'),
-      toolName: Schema.string().default('qq_media_link_resolve').description('QQ 媒体/文件解析 ChatLuna 工具名称。'),
-      description: Schema.string().role('textarea').default('Resolves recent QQ/OneBot media and file messages through one unified tool, including images, voice/audio, common text files, and attachments. It verifies the original URL, optionally stores the asset in the managed cache, and can include a bounded text preview for text files. Use imageIndex as a backward-compatible alias for image mediaIndex.').description('工具描述。'),
-      maxTrackedMessages: Schema.number().min(10).max(1000).default(120).description('仅在内存中保留最近多少条含媒体/文件消息索引，不写入磁盘。'),
-      cacheOnResolve: Schema.boolean().default(true).description('工具被调用时是否按需下载并写入统一缓存。'),
-      maxDownloadBytes: Schema.number().min(100000).max(50000000).default(12000000).description('非图片媒体/文件最大下载字节数。'),
-      textPreviewBytes: Schema.number().min(256).max(262144).default(32768).description('文本文件预览最大字节数。')
-    }).description('QQ 媒体/文件')
-  }),
-  Schema.object({
-    storage: Schema.object({
-      localFallback: Schema.boolean().default(true).description('没有 chatluna-storage-service 时，是否使用插件本地目录和 HTTP 路由兜底。'),
-      localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
-      localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。'),
-      retentionDays: Schema.number().min(1).max(365).default(7).description('统一图片缓存保留天数。'),
-      cleanupIntervalHours: Schema.number().min(1).max(24 * 30).default(24).description('统一图片缓存清理间隔小时数。')
-    }).description('本地转存')
-  }),
-  Schema.object({
-    delivery: Schema.object({
-      publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取图片的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景，例如 http://172.26.0.1:5140。留空则保留存储服务原 URL。')
-    }).description('发送链接')
-  }),
-  Schema.object({
-    webdav: Schema.object({
-      enabled: Schema.boolean().default(false).description('是否同步到 WebDAV。'),
-      endpoint: Schema.string().default('').description('WebDAV 根地址，例如 https://example.com/dav。'),
-      username: Schema.string().default('').description('WebDAV 用户名。'),
-      password: Schema.string().role('secret').default('').description('WebDAV 密码。'),
-      basePath: Schema.string().default('chatluna-images').description('WebDAV 目录。'),
-      publicBaseUrl: Schema.string().default('').description('公开访问根地址；留空则只同步，不返回公开 URL。')
-    }).description('WebDAV 同步'),
-    debug: Schema.boolean().default(false).description('输出调试日志。')
+export const Config: Schema<any> = Schema.object({
+  credentials: Schema.object({
+    serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key。获取方式：登录 serpapi.com，在 Dashboard / API Key 页面复制。以文搜图和 SerpApi 反搜都会复用这一处。'),
+    googleClientEmail: Schema.string().default('').description('Google Cloud 服务账号 client_email。获取方式：Google Cloud Console -> IAM 和管理 -> 服务账号 -> 创建密钥，下载 JSON 后只复制 client_email 字段。'),
+    googlePrivateKey: Schema.string().role('secret').default('').description('Google Cloud 服务账号 private_key。只复制 JSON 里的 private_key 字段；可保留 JSON 中的 \\n 转义换行。项目需启用 Cloud Vision API。'),
+    googleProjectId: Schema.string().default('').description('Google Cloud 项目 ID，仅用于辅助识别配置；认证实际使用 client_email 与 private_key。'),
+    googleTokenUri: Schema.string().default('https://oauth2.googleapis.com/token').description('Google OAuth token_uri。通常保持默认；如果服务账号 JSON 中 token_uri 不同，再复制该字段。'),
+    googleApiKey: Schema.string().role('secret').default('').description('旧版兼容字段：Google Cloud Vision API Key。新配置请优先使用服务账号 client_email/private_key。')
+  }).description('API 凭据'),
+  features: Schema.object({
+    toolEnabled: Schema.boolean().default(true).description('是否注册以文搜图工具。'),
+    toolName: Schema.string().default('image_search_resolve').description('以文搜图工具名称。'),
+    toolDescription: Schema.string().role('textarea').default('Searches for images, extracts real image candidates, downloads them with browser-like headers, stores them as Koishi-accessible URLs, and returns ready-to-send image links. Use this instead of sending remote hotlink URLs directly.').description('以文搜图工具描述。'),
+    reverseEnabled: Schema.boolean().default(true).description('是否注册以图搜图工具。'),
+    reverseToolName: Schema.string().default('image_reverse_search_resolve').description('以图搜图工具名称。'),
+    reverseDescription: Schema.string().role('textarea').default('Reverse-searches an image with automatic provider selection: Google Vision service-account OAuth for private/local images that require downloaded bytes, and SerpApi Google Lens for public QQ/Tencent CDN image URLs.').description('以图搜图工具描述。'),
+    qqMediaEnabled: Schema.boolean().default(true).description('是否注册 qq多媒体直链解析工具。'),
+    qqMediaToolName: Schema.string().default('qq_media_link_resolve').description('qq多媒体直链解析工具名称。'),
+    qqMediaDescription: Schema.string().role('textarea').default('Resolves recent QQ/OneBot media and file messages through one unified tool, including images, voice/audio, common text files, and attachments. It verifies the original URL, optionally stores the asset in the managed cache, and can include a bounded text preview for text files. Use imageIndex as a backward-compatible alias for image mediaIndex.').description('qq多媒体直链解析工具描述。')
+  }).description('功能开关'),
+  textSearch: Schema.object({
+    provider: Schema.const('serpapi').default('serpapi').description('固定使用 SerpApi Google Images，直接返回原图候选。'),
+    serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain；留空则使用默认。'),
+    serpApiGl: Schema.string().default('cn').description('SerpApi gl 地区参数。'),
+    serpApiHl: Schema.string().default('zh-cn').description('SerpApi hl 语言参数。'),
+    serpApiSafe: Schema.union([
+      Schema.const('active').description('开启 Google SafeSearch。'),
+      Schema.const('off').description('关闭 Google SafeSearch。')
+    ]).default('active').description('SerpApi safe 参数。'),
+    maxSearchResults: Schema.number().min(1).max(100).default(12).description('最多读取多少条搜索结果。'),
+    maxCount: Schema.number().min(1).max(8).default(4).description('单次最多返回图片数。'),
+    minWidth: Schema.number().min(1).max(4000).default(220).description('候选图片最小宽度。'),
+    minHeight: Schema.number().min(1).max(4000).default(220).description('候选图片最小高度。')
+  }).description('以文搜图'),
+  reverseSearch: Schema.object({
+    provider: Schema.union([
+      Schema.const('auto').description('自动选择：私有/本地 URL 且配置了 Google 服务账号时走 Google Vision；公网 QQ/Tencent CDN 图片优先走 SerpApi Google Lens。'),
+      Schema.const('serpapi').description('SerpApi Google Reverse Image API，使用 image_url。'),
+      Schema.const('serpapi-lens').description('SerpApi Google Lens API，使用 url，适合 QQ/NapCat 原始图片 CDN 链接。'),
+      Schema.const('google').description('Google Cloud Vision Web Detection，使用服务账号 OAuth；插件会下载图片并转为 base64。')
+    ]).default('auto').description('以图搜图提供方。'),
+    serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain。'),
+    maxResults: Schema.number().min(1).max(50).default(10).description('最大反搜结果数。'),
+    publicBaseUrl: Schema.string().default('').description('公网 Koishi 根地址；SerpApi 需要公网 URL 时用于改写 ChatLuna/本地缓存链接。'),
+    customPrompt: Schema.string().role('textarea').default('').description('附加到以图搜图工具结果中的模型提示。')
+  }).description('以图搜图'),
+  qqMedia: Schema.object({
+    maxTrackedMessages: Schema.number().min(10).max(1000).default(120).description('仅在内存中保留最近多少条含媒体/文件消息索引，不写入磁盘。'),
+    cacheOnResolve: Schema.boolean().default(true).description('工具被调用时是否按需下载并写入统一缓存。'),
+    textPreviewBytes: Schema.number().min(256).max(262144).default(32768).description('文本文件预览最大字节数。')
+  }).description('QQ 多媒体解析'),
+  storage: Schema.object({
+    ttlHours: Schema.number().min(1).max(24 * 365).default(24 * 7).description('所有受管缓存资源的统一保留时间，单位小时。'),
+    localFallback: Schema.boolean().default(true).description('没有 chatluna-storage-service 时，是否使用插件本地目录和 HTTP 路由兜底。'),
+    localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地兜底目录，相对 Koishi baseDir。'),
+    localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地兜底 HTTP 路径。'),
+    expiredRetentionHours: Schema.number().min(1).max(24 * 365).default(24 * 3).description('原始直链检测失效后，缓存资源继续保留多少小时再清理。'),
+    cleanupIntervalHours: Schema.number().min(1).max(24 * 30).default(24).description('统一缓存清理间隔小时数。'),
+    publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取资源的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景。'),
+    webdavEnabled: Schema.boolean().default(false).description('是否同步到 WebDAV。'),
+    webdavEndpoint: Schema.string().default('').description('WebDAV 根地址，例如 https://example.com/dav。'),
+    webdavUsername: Schema.string().default('').description('WebDAV 用户名。'),
+    webdavPassword: Schema.string().role('secret').default('').description('WebDAV 密码。'),
+    webdavBasePath: Schema.string().default('chatluna-images').description('WebDAV 目录。'),
+    webdavPublicBaseUrl: Schema.string().default('').description('WebDAV 公开访问根地址；留空则只同步，不返回公开 URL。')
+  }).description('存储与分发'),
+  http: Schema.object({
+    userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36').description('下载资源和调用外部 API 时使用的 User-Agent。'),
+    timeoutMs: Schema.number().min(3000).max(60000).default(12000).description('API 请求和下载超时。'),
+    imageBytes: Schema.number().min(100000).max(20000000).default(8000000).description('图片下载最大字节数。'),
+    mediaBytes: Schema.number().min(100000).max(50000000).default(12000000).description('非图片媒体/文件下载最大字节数。')
+  }).description('HTTP 请求'),
+  debugging: Schema.object({
+    useChatLunaProxy: Schema.boolean().default(true).description('启用后自动复用 ChatLuna 主插件的代理地址访问 Google Vision 等外部 API。'),
+    logging: Schema.boolean().default(false).description('调试日志')
+  }).description('调试')
+})
+
+const DEFAULT_CONFIG: Config = {
+  credentials: {
+    serpApiKey: '',
+    googleClientEmail: '',
+    googlePrivateKey: '',
+    googleProjectId: '',
+    googleTokenUri: 'https://oauth2.googleapis.com/token',
+    googleApiKey: ''
+  },
+  tool: {
+    enabled: true,
+    name: 'image_search_resolve',
+    description: 'Searches for images, extracts real image candidates, downloads them with browser-like headers, stores them as Koishi-accessible URLs, and returns ready-to-send image links. Use this instead of sending remote hotlink URLs directly.'
+  },
+  search: {
+    provider: 'serpapi',
+    serpApiKey: '',
+    serpApiGoogleDomain: 'google.com',
+    serpApiGl: 'cn',
+    serpApiHl: 'zh-cn',
+    serpApiSafe: 'active',
+    maxSearchResults: 12,
+    pageTimeoutMs: 12000
+  },
+  image: {
+    maxCount: 4,
+    maxDownloadBytes: 8000000,
+    minWidth: 220,
+    minHeight: 220,
+    tempExpireHours: 24 * 7,
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+  },
+  reverse: {
+    enabled: true,
+    toolName: 'image_reverse_search_resolve',
+    description: 'Reverse-searches an image with automatic provider selection: Google Vision service-account OAuth for private/local images that require downloaded bytes, and SerpApi Google Lens for public QQ/Tencent CDN image URLs.',
+    provider: 'auto',
+    serpApiKey: '',
+    serpApiGoogleDomain: 'google.com',
+    googleApiKey: '',
+    googleServiceAccountJson: '',
+    maxResults: 10,
+    publicBaseUrl: '',
+    customPrompt: ''
+  },
+  qqMedia: {
+    enabled: true,
+    toolName: 'qq_media_link_resolve',
+    description: 'Resolves recent QQ/OneBot media and file messages through one unified tool, including images, voice/audio, common text files, and attachments. It verifies the original URL, optionally stores the asset in the managed cache, and can include a bounded text preview for text files. Use imageIndex as a backward-compatible alias for image mediaIndex.',
+    maxTrackedMessages: 120,
+    cacheOnResolve: true,
+    maxDownloadBytes: 12000000,
+    textPreviewBytes: 32768
+  },
+  storage: {
+    localFallback: true,
+    localDirectory: 'data/chatluna-image-resolver',
+    localPublicPath: '/chatluna-image-resolver',
+    retentionDays: 7,
+    expiredRetentionDays: 3,
+    cleanupIntervalHours: 24
+  },
+  delivery: {
+    publicBaseUrl: ''
+  },
+  network: {
+    useChatLunaProxy: true
+  },
+  webdav: {
+    enabled: false,
+    endpoint: '',
+    username: '',
+    password: '',
+    basePath: 'chatluna-images',
+    publicBaseUrl: ''
+  },
+  debug: false
+}
+
+function merge<T extends Record<string, any>>(base: T, value: any): T {
+  return { ...base, ...(value && typeof value === 'object' ? value : {}) }
+}
+
+function compact<T extends Record<string, any>>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as Partial<T>
+}
+
+function daysFromHours(hours: number | undefined, fallbackDays: number) {
+  if (!Number.isFinite(Number(hours))) return fallbackDays
+  return Math.max(1 / 24, Number(hours) / 24)
+}
+
+function parseServiceAccountJson(raw: unknown) {
+  if (typeof raw !== 'string' || !raw.trim()) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return {
+      clientEmail: typeof parsed?.client_email === 'string' ? parsed.client_email : undefined,
+      privateKey: typeof parsed?.private_key === 'string' ? parsed.private_key : undefined,
+      projectId: typeof parsed?.project_id === 'string' ? parsed.project_id : undefined,
+      tokenUri: typeof parsed?.token_uri === 'string' ? parsed.token_uri : undefined
+    }
+  } catch {
+    return {}
+  }
+}
+
+function buildServiceAccountJson(credentials: Config['credentials']) {
+  if (!credentials.googleClientEmail.trim() || !credentials.googlePrivateKey.trim()) return ''
+  return JSON.stringify({
+    type: 'service_account',
+    project_id: credentials.googleProjectId.trim() || undefined,
+    client_email: credentials.googleClientEmail.trim(),
+    private_key: credentials.googlePrivateKey,
+    token_uri: credentials.googleTokenUri.trim() || DEFAULT_CONFIG.credentials.googleTokenUri
   })
-])
+}
+
+export function normalizeConfig(input: any = {}): Config {
+  const legacy = input && typeof input === 'object' ? input : {}
+  const nested = {
+    credentials: legacy.credentials || {},
+    features: legacy.features || {},
+    textSearch: legacy.textSearch || {},
+    reverseSearch: legacy.reverseSearch || {},
+    qqMedia: legacy.qqMedia || {},
+    storage: legacy.storage || {},
+    http: legacy.http || {},
+    debugging: legacy.debugging || {}
+  }
+  const flatFeatureTool = compact({
+    enabled: nested.features.toolEnabled,
+    name: nested.features.toolName,
+    description: nested.features.toolDescription
+  })
+  const flatFeatureReverse = compact({
+    enabled: nested.features.reverseEnabled,
+    toolName: nested.features.reverseToolName,
+    description: nested.features.reverseDescription
+  })
+  const flatFeatureMedia = compact({
+    enabled: nested.features.qqMediaEnabled,
+    toolName: nested.features.qqMediaToolName,
+    description: nested.features.qqMediaDescription
+  })
+  const flatTextSearchApi = compact({
+    provider: nested.textSearch.provider,
+    serpApiKey: nested.textSearch.serpApiKey,
+    serpApiGoogleDomain: nested.textSearch.serpApiGoogleDomain,
+    serpApiGl: nested.textSearch.serpApiGl,
+    serpApiHl: nested.textSearch.serpApiHl,
+    serpApiSafe: nested.textSearch.serpApiSafe,
+    maxSearchResults: nested.textSearch.maxSearchResults
+  })
+  const flatImageProcessing = compact({
+    maxCount: nested.textSearch.maxCount,
+    minWidth: nested.textSearch.minWidth,
+    minHeight: nested.textSearch.minHeight
+  })
+  const flatReverseProvider = compact({
+    provider: typeof nested.reverseSearch.provider === 'string' ? nested.reverseSearch.provider : undefined,
+    serpApiKey: nested.reverseSearch.serpApiKey,
+    serpApiGoogleDomain: nested.reverseSearch.serpApiGoogleDomain,
+    googleApiKey: nested.reverseSearch.googleApiKey,
+    googleServiceAccountJson: nested.reverseSearch.googleServiceAccountJson
+  })
+  const parsedGoogleServiceAccount = parseServiceAccountJson(
+    nested.credentials.googleServiceAccountJson
+      || nested.reverseSearch.googleServiceAccountJson
+      || (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.googleServiceAccountJson : '')
+      || legacy.reverse?.googleServiceAccountJson
+  )
+  const credentials = merge(DEFAULT_CONFIG.credentials, compact({
+    serpApiKey: nested.credentials.serpApiKey
+      ?? nested.textSearch.serpApiKey
+      ?? nested.textSearch.api?.serpApiKey
+      ?? nested.reverseSearch.serpApiKey
+      ?? (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.serpApiKey : undefined)
+      ?? legacy.search?.serpApiKey
+      ?? legacy.reverse?.serpApiKey,
+    googleClientEmail: nested.credentials.googleClientEmail
+      ?? parsedGoogleServiceAccount.clientEmail,
+    googlePrivateKey: nested.credentials.googlePrivateKey
+      ?? parsedGoogleServiceAccount.privateKey,
+    googleProjectId: nested.credentials.googleProjectId
+      ?? parsedGoogleServiceAccount.projectId,
+    googleTokenUri: nested.credentials.googleTokenUri
+      ?? parsedGoogleServiceAccount.tokenUri,
+    googleApiKey: nested.credentials.googleApiKey
+      ?? nested.reverseSearch.googleApiKey
+      ?? (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.googleApiKey : undefined)
+      ?? legacy.reverse?.googleApiKey
+  }))
+  const flatReverseBehavior = compact({
+    maxResults: nested.reverseSearch.maxResults,
+    publicBaseUrl: nested.reverseSearch.publicBaseUrl,
+    customPrompt: nested.reverseSearch.customPrompt
+  })
+  const flatMediaTracking = compact({
+    maxTrackedMessages: nested.qqMedia.maxTrackedMessages
+  })
+  const flatMediaCache = compact({
+    cacheOnResolve: nested.qqMedia.cacheOnResolve,
+    textPreviewBytes: nested.qqMedia.textPreviewBytes
+  })
+  const storageCache = {
+    ...(nested.storage.cache || {}),
+    ...compact({
+      ttlHours: nested.storage.ttlHours,
+      localFallback: nested.storage.localFallback,
+      localDirectory: nested.storage.localDirectory,
+      localPublicPath: nested.storage.localPublicPath,
+      expiredRetentionHours: nested.storage.expiredRetentionHours,
+      cleanupIntervalHours: nested.storage.cleanupIntervalHours
+    })
+  }
+  const storageDelivery = {
+    ...(nested.storage.delivery || {}),
+    ...compact({
+      publicBaseUrl: nested.storage.publicBaseUrl
+    })
+  }
+  const storageWebdav = {
+    ...(nested.storage.webdav || {}),
+    ...compact({
+      enabled: nested.storage.webdavEnabled,
+      endpoint: nested.storage.webdavEndpoint,
+      username: nested.storage.webdavUsername,
+      password: nested.storage.webdavPassword,
+      basePath: nested.storage.webdavBasePath,
+      publicBaseUrl: nested.storage.webdavPublicBaseUrl
+    })
+  }
+  const httpLimits = {
+    ...(nested.http.limits || {}),
+    ...compact({
+      imageBytes: nested.http.imageBytes,
+      mediaBytes: nested.http.mediaBytes
+    })
+  }
+  const debuggingNetwork = {
+    ...(nested.debugging.network || {}),
+    ...compact({
+      useChatLunaProxy: nested.debugging.useChatLunaProxy
+    })
+  }
+  const ttlHours = Number(storageCache.ttlHours ?? legacy.image?.tempExpireHours ?? DEFAULT_CONFIG.image.tempExpireHours)
+  const legacyExpiredHours = Number.isFinite(Number(legacy.storage?.expiredRetentionDays))
+    ? Number(legacy.storage.expiredRetentionDays) * 24
+    : undefined
+  const expiredHours = Number(storageCache.expiredRetentionHours ?? legacyExpiredHours ?? DEFAULT_CONFIG.storage.expiredRetentionDays * 24)
+
+  return {
+    credentials,
+    tool: merge(DEFAULT_CONFIG.tool, legacy.tool || nested.features.tool || flatFeatureTool),
+    search: {
+      ...merge(DEFAULT_CONFIG.search, legacy.search || nested.textSearch.api || flatTextSearchApi),
+      provider: 'serpapi',
+      serpApiKey: credentials.serpApiKey,
+      pageTimeoutMs: Number(nested.http.timeoutMs ?? legacy.search?.pageTimeoutMs ?? DEFAULT_CONFIG.search.pageTimeoutMs)
+    },
+    image: {
+      ...merge(DEFAULT_CONFIG.image, legacy.image || nested.textSearch.imageProcessing || flatImageProcessing),
+      tempExpireHours: ttlHours,
+      userAgent: String(nested.http.userAgent || legacy.image?.userAgent || DEFAULT_CONFIG.image.userAgent),
+      maxDownloadBytes: Number(httpLimits.imageBytes ?? legacy.image?.maxDownloadBytes ?? DEFAULT_CONFIG.image.maxDownloadBytes)
+    },
+    reverse: {
+      ...merge(DEFAULT_CONFIG.reverse, legacy.reverse),
+      ...merge({}, nested.features.reverse || flatFeatureReverse),
+      ...merge({}, typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider : flatReverseProvider),
+      ...merge({}, nested.reverseSearch.behavior || flatReverseBehavior),
+      serpApiKey: credentials.serpApiKey,
+      googleApiKey: credentials.googleApiKey,
+      googleServiceAccountJson: buildServiceAccountJson(credentials)
+    },
+    qqMedia: {
+      ...merge(DEFAULT_CONFIG.qqMedia, legacy.qqMedia),
+      ...merge({}, nested.features.qqMedia || flatFeatureMedia),
+      ...merge({}, nested.qqMedia.tracking || flatMediaTracking),
+      ...merge({}, nested.qqMedia.cache || flatMediaCache),
+      maxDownloadBytes: Number(httpLimits.mediaBytes ?? legacy.qqMedia?.maxDownloadBytes ?? DEFAULT_CONFIG.qqMedia.maxDownloadBytes)
+    },
+    storage: {
+      ...merge(DEFAULT_CONFIG.storage, legacy.storage),
+      localFallback: storageCache.localFallback ?? legacy.storage?.localFallback ?? DEFAULT_CONFIG.storage.localFallback,
+      localDirectory: storageCache.localDirectory ?? legacy.storage?.localDirectory ?? DEFAULT_CONFIG.storage.localDirectory,
+      localPublicPath: storageCache.localPublicPath ?? legacy.storage?.localPublicPath ?? DEFAULT_CONFIG.storage.localPublicPath,
+      retentionDays: daysFromHours(ttlHours, legacy.storage?.retentionDays ?? DEFAULT_CONFIG.storage.retentionDays),
+      expiredRetentionDays: daysFromHours(expiredHours, legacy.storage?.expiredRetentionDays ?? DEFAULT_CONFIG.storage.expiredRetentionDays),
+      cleanupIntervalHours: storageCache.cleanupIntervalHours ?? legacy.storage?.cleanupIntervalHours ?? DEFAULT_CONFIG.storage.cleanupIntervalHours
+    },
+    delivery: merge(DEFAULT_CONFIG.delivery, legacy.delivery || storageDelivery),
+    network: merge(DEFAULT_CONFIG.network, legacy.network || debuggingNetwork),
+    webdav: merge(DEFAULT_CONFIG.webdav, legacy.webdav || storageWebdav),
+    debug: Boolean(legacy.debug ?? nested.debugging.logging ?? DEFAULT_CONFIG.debug)
+  }
+}
 
 export const usage = `
 <p><strong>Miyako ChatLuna 媒体解析器</strong></p>
-<p>注册 <code>image_search_resolve</code>、<code>image_reverse_search_resolve</code> 和统一的 <code>qq_media_link_resolve</code> 工具，用于搜图、以图搜图、按需解析 QQ 群图片/语音/文本文件直链、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
+<p>注册以文搜图工具 <code>image_search_resolve</code>、以图搜图工具 <code>image_reverse_search_resolve</code> 和 qq多媒体直链解析工具 <code>qq_media_link_resolve</code>，用于按需解析图片/语音/文本文件直链、下载外链、转存为 Koishi 可访问链接，并可选同步到 WebDAV。</p>
 <p>本地缓存默认保留 7 天。启用 console 后，可在插件详情页查看资源缓存并检测原始直链存活状态。</p>
 `
 
@@ -210,9 +494,6 @@ declare module 'koishi' {
       }
       createTempFile: (buffer: Buffer, filename: string, expireHours?: number, mimeType?: string) => Promise<{ url: string }>
     }
-    puppeteer?: {
-      page: () => Promise<any>
-    }
     server?: {
       selfUrl?: string
       get: (path: string, handler: (koa: any) => Promise<void> | void) => void
@@ -222,6 +503,16 @@ declare module 'koishi' {
       addEntry: (entry: { dev: string; prod: string }) => void
     }
   }
+}
+
+function configureProxyFromChatLuna(ctx: Context, config: Config) {
+  if (!config.network?.useChatLunaProxy) {
+    configureFetchProxy()
+    return
+  }
+  const chatlunaConfig = ctx.chatluna?.config || {}
+  const proxy = chatlunaConfig.isProxy ? String(chatlunaConfig.proxyAddress || '').trim() : ''
+  configureFetchProxy(proxy || undefined)
 }
 
 class ImageResolverTool extends StructuredTool {
@@ -362,7 +653,7 @@ class QQMediaLinkResolverTool extends StructuredTool {
           ? 'Use originalUrl with image_reverse_search_resolve provider=auto or provider=serpapi-lens for QQ/Tencent CDN image URLs.'
           : 'Use cachedUrl with image_reverse_search_resolve provider=auto when the original URL is private or not confirmed public.',
         googleVision: cachedUrl || originalUrl
-          ? 'Google Vision is useful only when the bot host can reach vision.googleapis.com and Koishi can download the image bytes.'
+          ? 'Google Vision uses credentials.googleClientEmail and credentials.googlePrivateKey, exchanges them for a short-lived OAuth token, and is useful only when the bot host can reach vision.googleapis.com and Koishi can download the image bytes.'
           : 'No usable URL is available for Google Vision.',
         chatluna: cachedUrl
           ? 'Use cachedUrl for local delivery and later cache inspection.'
@@ -377,7 +668,11 @@ class QQMediaLinkResolverTool extends StructuredTool {
   }
 }
 
-export function apply(ctx: Context, config: Config) {
+export function apply(ctx: Context, input: ConfigInput | Config) {
+  const config = normalizeConfig(input)
+
+  configureProxyFromChatLuna(ctx, config)
+
   ctx.console?.addEntry({
     dev: resolve(__dirname, '../client/index.ts'),
     prod: resolve(__dirname, '../dist')
@@ -400,14 +695,38 @@ export function apply(ctx: Context, config: Config) {
       })
       ctx2.server.get(`${config.storage.localPublicPath}/_cache/check`, async (koa) => {
         const url = String(koa.query?.url ?? '').trim()
+        const manifest = String(koa.query?.manifest ?? '').trim()
+        const result = await checkRemoteImageAlive(url, config)
+        if (manifest && result.ok === false) {
+          await markManagedCacheEntryExpired(join(ctx.baseDir, config.storage.localDirectory), manifest, result)
+            .catch((error) => ctx.logger(name).warn('mark expired media cache failed: %s', formatError(error)))
+        }
         koa.set('Content-Type', 'application/json; charset=utf-8')
-        koa.body = JSON.stringify(await checkRemoteImageAlive(url, config))
+        koa.body = JSON.stringify(result)
       })
       ctx2.server.post?.(`${config.storage.localPublicPath}/_cache/check`, async (koa) => {
         const body = await readJsonBody(koa)
         const url = String(body?.url ?? '').trim()
+        const manifest = String(body?.manifest ?? '').trim()
+        const result = await checkRemoteImageAlive(url, config)
+        if (manifest && result.ok === false) {
+          await markManagedCacheEntryExpired(join(ctx.baseDir, config.storage.localDirectory), manifest, result)
+            .catch((error) => ctx.logger(name).warn('mark expired media cache failed: %s', formatError(error)))
+        }
         koa.set('Content-Type', 'application/json; charset=utf-8')
-        koa.body = JSON.stringify(await checkRemoteImageAlive(url, config))
+        koa.body = JSON.stringify(result)
+      })
+      ctx2.server.get(`${config.storage.localPublicPath}/_diagnostics/google-vision`, async (koa) => {
+        configureProxyFromChatLuna(ctx2, config)
+        const result = await diagnoseGoogleVision(config)
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify(result)
+      })
+      ctx2.server.post?.(`${config.storage.localPublicPath}/_diagnostics/google-vision`, async (koa) => {
+        configureProxyFromChatLuna(ctx2, config)
+        const result = await diagnoseGoogleVision(config)
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify(result)
       })
       ctx2.server.get(`${config.storage.localPublicPath}/:name`, async (koa) => {
         const filename = String(koa.params.name ?? '')
@@ -426,17 +745,20 @@ export function apply(ctx: Context, config: Config) {
     })
     ctx.on('ready', () => {
       void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
-        retentionDays: config.storage.retentionDays
+        retentionDays: config.storage.retentionDays,
+        expiredRetentionDays: config.storage.expiredRetentionDays
       }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
     })
     ctx.setInterval?.(() => {
       void cleanupManagedImageCache(join(ctx.baseDir, config.storage.localDirectory), {
-        retentionDays: config.storage.retentionDays
+        retentionDays: config.storage.retentionDays,
+        expiredRetentionDays: config.storage.expiredRetentionDays
       }).catch((error) => ctx.logger(name).warn('image cache cleanup failed: %s', formatError(error)))
     }, Math.max(1, config.storage.cleanupIntervalHours) * 60 * 60 * 1000)
   }
 
   const registerTool = (ctx2: Context) => {
+    configureProxyFromChatLuna(ctx2, config)
     if (!ctx2.chatluna?.platform?.registerTool) {
       ctx2.logger(name).warn('ChatLuna platform is unavailable; skip registering image resolver tool.')
       return

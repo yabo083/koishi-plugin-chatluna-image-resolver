@@ -1,34 +1,28 @@
 import { Context } from 'koishi'
-import { createHash } from 'node:crypto'
-import type { Config, GoogleReverseResult, ImageCandidate, SearchResult, SerpApiLensResult, SerpApiReverseResult, StoredImage } from './types'
-import { downloadImageFromUrl, downloadMediaFromUrl, ensureWebDavCollections, storeManagedAsset, storeManagedImage } from './cache'
+import { createHash, createSign } from 'node:crypto'
+import type { Config, GoogleReverseResult, ImageCandidate, SerpApiLensResult, SerpApiReverseResult, StoredImage } from './types'
+import { downloadMediaFromUrl, ensureWebDavCollections, storeManagedAsset, storeManagedImage } from './cache'
 import {
   attachReverseNote,
   basicAuth,
   buildGoogleVisionWebDetectionRequest,
+  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
   buildSerpApiReverseImageUrl,
-  candidatesFromRawImage,
   clamp,
-  decodeDuckUrl,
-  decodeHtml,
   extFromUrl,
   fetchWithTimeout,
   formatError,
   isPublicHttpUrl,
-  looksLikeImageUrl,
   mimeToExt,
   normalizeImageUrl,
   normalizeWebDetection,
-  parseAttributes,
-  pushCandidate,
   rewriteImageUrlForPublicAccess,
   scoreCandidate,
   serpApiImagesToCandidates,
   serpApiLensPayloadToResult,
   serpApiReversePayloadToResult,
-  stripTags,
   trimSlashes,
   trimTrailingSlash,
   uniqueBy
@@ -37,19 +31,27 @@ import {
 export type ReverseProvider = Config['reverse']['provider']
 export type ResolvedReverseProvider = Exclude<ReverseProvider, 'auto'>
 
+const GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL = 'https://tse1.mm.bing.net/th/id/OIP.wm8JD4yZQvYkDxtZpPR3vAHaFU?r=0&rs=1&pid=ImgDetMain&o=7&rm=3'
+const GOOGLE_VISION_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
+const DEFAULT_GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token'
+
+const googleTokenCache = new Map<string, { token: string; expiresAt: number }>()
+
 export function selectReverseProvider(options: {
   configuredProvider: ReverseProvider
   providerOverride?: ReverseProvider
   imageUrl: string
   publicImageUrl?: string
-  hasGoogleKey: boolean
+  hasGoogleCredentials?: boolean
+  hasGoogleKey?: boolean
 }) {
   const requested = options.providerOverride ?? options.configuredProvider
   const publicImageUrl = options.publicImageUrl ?? options.imageUrl
   const publicUrl = isPublicHttpUrl(publicImageUrl)
+  const hasGoogleCredentials = options.hasGoogleCredentials || Boolean(options.hasGoogleKey)
 
   if (requested !== 'auto') {
-    if ((requested === 'serpapi' || requested === 'serpapi-lens') && !publicUrl && options.hasGoogleKey) {
+    if ((requested === 'serpapi' || requested === 'serpapi-lens') && !publicUrl && hasGoogleCredentials) {
       return {
         provider: 'google' as const,
         reason: 'Selected Google Vision because the configured URL-based provider requires a public URL and this image looks private/local.'
@@ -61,7 +63,7 @@ export function selectReverseProvider(options: {
     }
   }
 
-  if (!publicUrl && options.hasGoogleKey) {
+  if (!publicUrl && hasGoogleCredentials) {
     return {
       provider: 'google' as const,
       reason: 'Auto selected Google Vision because the image URL is private/local and must be submitted as downloaded bytes.'
@@ -81,31 +83,215 @@ export function selectReverseProvider(options: {
   }
 }
 
+export async function diagnoseGoogleVision(config: Config) {
+  const hasCredentials = hasGoogleVisionCredentials(config)
+  if (!hasCredentials) {
+    return {
+      ok: false,
+      stage: 'config',
+      reason: 'missing-google-service-account',
+      hint: '请在“API 凭据”里填写 Google 服务账号 client_email 与 private_key，并确保该项目已启用 Cloud Vision API。'
+    }
+  }
+
+  try {
+    const diagnosticImage = await downloadGoogleVisionDiagnosticImage(config)
+    const local = await callGoogleVisionDiagnostic(config, {
+      id: 'local-base64',
+      label: '样例图下载后 base64',
+      imageUrl: GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL,
+      body: buildGoogleVisionWebDetectionRequest(diagnosticImage, 5)
+    })
+    if (!local.ok) return local
+
+    const remote = await callGoogleVisionDiagnostic(config, {
+      id: 'public-image-url',
+      label: '公网 imageUri',
+      imageUrl: GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL,
+      body: buildGoogleVisionWebDetectionUriRequest(GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL, 5)
+    })
+    if (!remote.ok) return {
+      ...remote,
+      hint: '服务账号可用于 base64 图片，但公网 imageUri 测试失败。真实本地/缓存图仍可走 Google Vision；如果你要让 Google 直接抓公网图片，再检查该 URL 是否可被 Google 后端访问。'
+    }
+
+    return {
+      ok: true,
+      stage: 'vision-api',
+      status: remote.status,
+      reason: 'reachable',
+      tests: [local, remote],
+      hint: 'Google Vision 服务账号、base64 图片提交、公网 imageUri 提交均可用。'
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      stage: 'network',
+      reason: 'network-or-proxy',
+      error: formatError(error),
+      hint: '请求没有成功到达 Google OAuth 或 Google Vision，优先检查宿主机网络、代理和 ChatLuna 代理配置。'
+    }
+  }
+}
+
+async function downloadGoogleVisionDiagnosticImage(config: Config) {
+  const response = await fetchWithTimeout(GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL, {
+    headers: {
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      'User-Agent': config.image.userAgent
+    }
+  }, config.search.pageTimeoutMs)
+  if (!response.ok) throw new Error(`fetch diagnostic image failed: HTTP ${response.status}`)
+  const mime = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+  if (mime && !mime.startsWith('image/')) throw new Error(`fetch diagnostic image failed: not image (${mime})`)
+  const buffer = Buffer.from(await response.arrayBuffer())
+  if (!buffer.length) throw new Error('fetch diagnostic image failed: empty body')
+  if (buffer.length > config.image.maxDownloadBytes) throw new Error(`diagnostic image too large: ${buffer.length}`)
+  return buffer
+}
+
+async function callGoogleVisionDiagnostic(config: Config, options: {
+  id: string
+  label: string
+  imageUrl?: string
+  body: unknown
+}) {
+  const auth = await googleVisionAuthHeaders(config)
+  const apiResponse = await fetchWithTimeout(
+    googleVisionAnnotateUrl(config),
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'User-Agent': config.image.userAgent,
+        ...auth
+      },
+      body: JSON.stringify(options.body)
+    },
+    config.search.pageTimeoutMs
+  )
+  const payload: any = await apiResponse.json().catch(() => ({}))
+  const message = payload?.error?.message || payload?.responses?.[0]?.error?.message || ''
+  if (!apiResponse.ok || message) {
+    const status = apiResponse.status
+    return {
+      ok: false,
+      stage: 'vision-api',
+      test: options.id,
+      label: options.label,
+      imageUrl: options.imageUrl,
+      status,
+      reason: status === 400 || status === 401 || status === 403 ? 'service-account-or-api-state' : 'vision-api-error',
+      error: message || `Google Vision HTTP ${status}`,
+      hint: status === 400 || status === 401 || status === 403
+        ? '网络已打到 Google Vision，但服务账号权限、Cloud Vision API 启用状态、结算/配额或项目 IAM 有问题。'
+        : '已连接到 Google Vision，但服务端返回了非成功状态。'
+    }
+  }
+  return {
+    ok: true,
+    stage: 'vision-api',
+    test: options.id,
+    label: options.label,
+    imageUrl: options.imageUrl,
+    status: apiResponse.status,
+    bestGuessLabels: payload?.responses?.[0]?.webDetection?.bestGuessLabels || [],
+    webEntityCount: payload?.responses?.[0]?.webDetection?.webEntities?.length || 0
+  }
+}
+
+function hasGoogleVisionCredentials(config: Config) {
+  return Boolean(config.reverse.googleServiceAccountJson?.trim() || config.reverse.googleApiKey?.trim())
+}
+
+function googleVisionAnnotateUrl(config: Config) {
+  const legacyKey = config.reverse.googleApiKey?.trim()
+  return legacyKey && !config.reverse.googleServiceAccountJson?.trim()
+    ? `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(legacyKey)}`
+    : 'https://vision.googleapis.com/v1/images:annotate'
+}
+
+async function googleVisionAuthHeaders(config: Config): Promise<Record<string, string>> {
+  if (!config.reverse.googleServiceAccountJson?.trim()) return {}
+  const token = await getGoogleServiceAccountAccessToken(config)
+  return { Authorization: `Bearer ${token}` }
+}
+
+async function getGoogleServiceAccountAccessToken(config: Config) {
+  const credentials = parseGoogleServiceAccount(config.reverse.googleServiceAccountJson)
+  const cacheKey = createHash('sha1')
+    .update(`${credentials.client_email}\n${credentials.private_key}`)
+    .digest('hex')
+  const cached = googleTokenCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token
+
+  const now = Math.floor(Date.now() / 1000)
+  const tokenUri = credentials.token_uri || DEFAULT_GOOGLE_TOKEN_URI
+  const header = base64UrlJson({ alg: 'RS256', typ: 'JWT' })
+  const claim = base64UrlJson({
+    iss: credentials.client_email,
+    scope: GOOGLE_VISION_SCOPE,
+    aud: tokenUri,
+    exp: now + 3600,
+    iat: now
+  })
+  const unsigned = `${header}.${claim}`
+  const signer = createSign('RSA-SHA256')
+  signer.update(unsigned)
+  signer.end()
+  const signature = signer.sign(credentials.private_key, 'base64url')
+  const assertion = `${unsigned}.${signature}`
+  const response = await fetchWithTimeout(tokenUri, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': config.image.userAgent
+    },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion
+    }).toString()
+  }, config.search.pageTimeoutMs)
+  const payload: any = await response.json().catch(() => ({}))
+  if (!response.ok || !payload?.access_token) {
+    throw new Error(payload?.error_description || payload?.error || `Google OAuth HTTP ${response.status}`)
+  }
+  const expiresIn = Number(payload.expires_in) || 3600
+  googleTokenCache.set(cacheKey, {
+    token: String(payload.access_token),
+    expiresAt: Date.now() + Math.max(60, expiresIn - 60) * 1000
+  })
+  return String(payload.access_token)
+}
+
+function parseGoogleServiceAccount(raw: string) {
+  let parsed: any
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('Google service account JSON is not valid JSON')
+  }
+  const client_email = String(parsed?.client_email || '').trim()
+  const private_key = String(parsed?.private_key || '').replace(/\\n/g, '\n')
+  const token_uri = String(parsed?.token_uri || DEFAULT_GOOGLE_TOKEN_URI).trim()
+  if (!client_email || !private_key) {
+    throw new Error('Google service account JSON must include client_email and private_key')
+  }
+  return { client_email, private_key, token_uri }
+}
+
+function base64UrlJson(value: unknown) {
+  return Buffer.from(JSON.stringify(value)).toString('base64url')
+}
+
 export class ImageResolver {
   constructor(private ctx: Context, private config: Config) {}
 
   async resolve(query: string, count: number, safeMode: boolean) {
     const failures: string[] = []
     const candidates: ImageCandidate[] = []
-    const seenPages = new Set<string>()
     const directCandidates = await this.searchDirectImages(query, count, failures)
     candidates.push(...directCandidates.map((candidate) => scoreCandidate(candidate, this.config, safeMode)))
-
-    if (this.config.search.provider !== 'serpapi' && candidates.length < count * 2) {
-      const searchResults = await this.search(query, failures)
-
-      for (const result of searchResults.slice(0, this.config.search.maxPages)) {
-        if (seenPages.has(result.url)) continue
-        seenPages.add(result.url)
-        if (looksLikeImageUrl(result.url)) {
-          candidates.push(scoreCandidate({ url: result.url, sourcePage: result.url, score: 0, reason: 'search-result-url' }, this.config, safeMode))
-          continue
-        }
-        const pageCandidates = await this.extractFromPage(result.url, failures)
-        candidates.push(...pageCandidates.map((candidate: ImageCandidate) => scoreCandidate(candidate, this.config, safeMode)))
-        if (candidates.length >= count * 4) break
-      }
-    }
 
     const ranked = uniqueBy(candidates, (item) => normalizeImageUrl(item.url))
       .filter((item) => item.score > 0)
@@ -138,10 +324,7 @@ export class ImageResolver {
       ok: images.length > 0,
       query,
       images,
-      searchedPages: uniqueBy([
-        ...directCandidates.map((candidate) => candidate.sourcePage),
-        ...Array.from(seenPages)
-      ], (item) => item),
+      searchedPages: uniqueBy(directCandidates.map((candidate) => candidate.sourcePage), (item) => item),
       candidateCount: ranked.length,
       failures: failures.slice(-12),
       hint: images.length > 0
@@ -150,21 +333,7 @@ export class ImageResolver {
     }
   }
 
-  private async search(query: string, failures: string[]) {
-    const results: SearchResult[] = []
-    const provider = this.config.search.provider
-    if ((provider === 'tavily' || provider === 'both' || provider === 'serpapi-fallback') && this.config.search.tavilyApiKey.trim()) {
-      results.push(...await this.searchTavily(query, failures))
-    }
-    if (provider === 'duckduckgo' || provider === 'both' || provider === 'serpapi-fallback' || results.length === 0) {
-      results.push(...await this.searchDuckDuckGo(query, failures))
-    }
-    return uniqueBy(results, (item) => item.url).slice(0, this.config.search.maxSearchResults)
-  }
-
   private async searchDirectImages(query: string, count: number, failures: string[]) {
-    const provider = this.config.search.provider
-    if (provider !== 'serpapi' && provider !== 'serpapi-fallback') return []
     if (!this.config.search.serpApiKey.trim()) {
       failures.push('serpapi failed: missing API key')
       return []
@@ -196,110 +365,6 @@ export class ImageResolver {
     } catch (error) {
       failures.push(`serpapi failed: ${formatError(error)}`)
       return []
-    }
-  }
-
-  private async searchTavily(query: string, failures: string[]) {
-    try {
-      const response = await fetchWithTimeout('https://api.tavily.com/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: this.config.search.tavilyApiKey,
-          query: `${query} image wallpaper fanart`,
-          search_depth: 'basic',
-          max_results: this.config.search.maxSearchResults
-        })
-      }, this.config.search.pageTimeoutMs)
-      const payload: any = await response.json()
-      return (payload.results ?? []).map((item: any) => ({
-        title: String(item.title ?? ''),
-        url: String(item.url ?? ''),
-        snippet: String(item.content ?? '')
-      })).filter((item: SearchResult) => item.url.startsWith('http'))
-    } catch (error) {
-      failures.push(`tavily failed: ${formatError(error)}`)
-      return []
-    }
-  }
-
-  private async searchDuckDuckGo(query: string, failures: string[]) {
-    const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(`${query} 图片 壁纸 fanart`) }`
-    try {
-      const response = await fetchWithTimeout(url, {
-        headers: {
-          'User-Agent': this.config.image.userAgent,
-          'Accept': 'text/html,application/xhtml+xml'
-        }
-      }, this.config.search.pageTimeoutMs)
-      const html = await response.text()
-      const results: SearchResult[] = []
-      const linkPattern = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi
-      let match: RegExpExecArray | null
-      while ((match = linkPattern.exec(html)) && results.length < this.config.search.maxSearchResults) {
-        const decoded = decodeHtml(match[1])
-        const resultUrl = decodeDuckUrl(decoded)
-        if (!resultUrl?.startsWith('http')) continue
-        results.push({ title: stripTags(match[2]), url: resultUrl })
-      }
-      return results
-    } catch (error) {
-      failures.push(`duckduckgo failed: ${formatError(error)}`)
-      return []
-    }
-  }
-
-  private async extractFromPage(url: string, failures: string[]) {
-    try {
-      const response = await fetchWithTimeout(url, {
-        headers: {
-          'User-Agent': this.config.image.userAgent,
-          'Accept': 'text/html,application/xhtml+xml',
-          'Referer': new URL(url).origin
-        }
-      }, this.config.search.pageTimeoutMs)
-      const contentType = response.headers.get('content-type') ?? ''
-      if (contentType.startsWith('image/')) {
-        return [{ url, sourcePage: url, score: 0, reason: 'page-is-image' }]
-      }
-      const html = await response.text()
-      const candidates = extractImageCandidates(html, url)
-      if (candidates.length || !this.config.search.usePuppeteerFallback || !this.ctx.puppeteer) {
-        return candidates
-      }
-    } catch (error) {
-      failures.push(`html extract failed: ${url} (${formatError(error)})`)
-    }
-    if (!this.config.search.usePuppeteerFallback || !this.ctx.puppeteer) return []
-    return this.extractWithPuppeteer(url, failures)
-  }
-
-  private async extractWithPuppeteer(url: string, failures: string[]) {
-    let page: any
-    try {
-      page = await this.ctx.puppeteer!.page()
-      await page.setUserAgent?.(this.config.image.userAgent)
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.config.search.pageTimeoutMs })
-      await page.evaluate(() => window.scrollTo(0, Math.min(document.body.scrollHeight, 2400)))
-      await page.waitForTimeout?.(800)
-      const raw = await page.evaluate(() => {
-        const out: any[] = []
-        document.querySelectorAll('img, source').forEach((node: any) => {
-          out.push({
-            src: node.currentSrc || node.src || node.getAttribute('src') || node.getAttribute('data-src') || node.getAttribute('data-original'),
-            srcset: node.getAttribute('srcset'),
-            width: node.naturalWidth || node.width,
-            height: node.naturalHeight || node.height
-          })
-        })
-        return out
-      })
-      return raw.flatMap((item: any) => candidatesFromRawImage(item, url))
-    } catch (error) {
-      failures.push(`puppeteer extract failed: ${url} (${formatError(error)})`)
-      return []
-    } finally {
-      await page?.close?.().catch(() => undefined)
     }
   }
 
@@ -376,7 +441,7 @@ export class ReverseImageResolver {
       providerOverride,
       imageUrl,
       publicImageUrl,
-      hasGoogleKey: Boolean(this.config.reverse.googleApiKey.trim())
+      hasGoogleCredentials: hasGoogleVisionCredentials(this.config)
     })
     const provider = selected.provider
     const maxResults = clamp(maxResultsOverride ?? this.config.reverse.maxResults, 1, 50)
@@ -462,8 +527,7 @@ export class ReverseImageResolver {
   }
 
   private async callGoogleVision(imageUrl: string, maxResults: number): Promise<GoogleReverseResult> {
-    const apiKey = this.config.reverse.googleApiKey.trim()
-    if (!apiKey) throw new Error('missing Google Vision API key')
+    if (!hasGoogleVisionCredentials(this.config)) throw new Error('missing Google Vision service-account credentials')
     const imageResponse = await fetchWithTimeout(imageUrl, {
       headers: {
         'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
@@ -476,13 +540,15 @@ export class ReverseImageResolver {
     const buffer = Buffer.from(await imageResponse.arrayBuffer())
     if (buffer.length > this.config.image.maxDownloadBytes) throw new Error(`image too large: ${buffer.length}`)
 
+    const auth = await googleVisionAuthHeaders(this.config)
     const apiResponse = await fetchWithTimeout(
-      `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(apiKey)}`,
+      googleVisionAnnotateUrl(this.config),
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json; charset=utf-8',
-          'User-Agent': this.config.image.userAgent
+          'User-Agent': this.config.image.userAgent,
+          ...auth
         },
         body: JSON.stringify(buildGoogleVisionWebDetectionRequest(buffer, maxResults))
       },
@@ -516,30 +582,4 @@ export class ReverseImageResolver {
       return undefined
     }
   }
-
-}
-
-
-function extractImageCandidates(html: string, pageUrl: string): ImageCandidate[] {
-  const candidates: ImageCandidate[] = []
-  const metaPattern = /<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image|og:image:secure_url)["'][^>]+content=["']([^"']+)["'][^>]*>/gi
-  let match: RegExpExecArray | null
-  while ((match = metaPattern.exec(html))) {
-    pushCandidate(candidates, match[1], pageUrl, 'meta-image')
-  }
-  const imgPattern = /<(?:img|source)\b([^>]+)>/gi
-  while ((match = imgPattern.exec(html))) {
-    const attrs = parseAttributes(match[1])
-    candidates.push(...candidatesFromRawImage({
-      src: attrs.currentSrc || attrs.src || attrs['data-src'] || attrs['data-original'] || attrs['data-lazy-src'],
-      srcset: attrs.srcset || attrs['data-srcset'],
-      width: Number(attrs.width || 0),
-      height: Number(attrs.height || 0)
-    }, pageUrl))
-  }
-  const bgPattern = /url\((["']?)([^"')]+)\1\)/gi
-  while ((match = bgPattern.exec(html))) {
-    pushCandidate(candidates, match[2], pageUrl, 'css-url')
-  }
-  return uniqueBy(candidates, (item) => normalizeImageUrl(item.url))
 }

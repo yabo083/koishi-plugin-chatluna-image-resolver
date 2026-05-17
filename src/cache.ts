@@ -19,9 +19,10 @@ import {
 
 const loggerName = 'miyako-chatluna-media-resolver'
 
-export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; now?: number }) {
+export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; expiredRetentionDays?: number; now?: number }) {
   const now = options.now ?? Date.now()
   const cutoff = now - Math.max(1, options.retentionDays) * 24 * 60 * 60 * 1000
+  const expiredCutoff = now - Math.max(1, options.expiredRetentionDays ?? options.retentionDays) * 24 * 60 * 60 * 1000
   let deleted = 0
   let scanned = 0
   let skipped = 0
@@ -39,6 +40,16 @@ export async function cleanupManagedImageCache(directory: string, options: { ret
     scanned++
     const file = join(directory, entry)
     try {
+      if (entry.endsWith('.json')) {
+        const manifest = await readManifest(file)
+        const expiredAt = manifest?.originalUrlExpiredAt ? Date.parse(manifest.originalUrlExpiredAt) : 0
+        if (manifest?.originalUrlExpired && expiredAt && expiredAt <= expiredCutoff) {
+          const asset = typeof manifest.filename === 'string' ? join(directory, manifest.filename) : ''
+          if (asset) deleted += await deleteIfExists(asset)
+          deleted += await deleteIfExists(file)
+          continue
+        }
+      }
       const info = await stat(file)
       if (!info.isFile() || info.mtimeMs > cutoff) continue
       await unlink(file)
@@ -48,6 +59,29 @@ export async function cleanupManagedImageCache(directory: string, options: { ret
     }
   }
   return { scanned, deleted, skipped }
+}
+
+export async function markManagedCacheEntryExpired(directory: string, manifestName: string, check: Record<string, unknown>, now = Date.now()) {
+  if (!isManagedCacheFilename(manifestName) || !manifestName.endsWith('.json')) {
+    throw new Error('invalid managed manifest name')
+  }
+  const file = join(directory, manifestName)
+  const manifest = await readManifest(file)
+  if (!manifest) throw new Error('managed manifest not found or invalid')
+  const expired = check?.ok === false
+  const next = {
+    ...manifest,
+    originalUrlExpired: expired || manifest.originalUrlExpired === true,
+    originalUrlExpiredAt: expired
+      ? new Date(now).toISOString()
+      : manifest.originalUrlExpiredAt,
+    originalUrlLastCheck: {
+      ...check,
+      checkedAt: new Date(now).toISOString()
+    }
+  }
+  await writeFile(file, JSON.stringify(next, null, 2))
+  return next
 }
 
 export async function listManagedImageCache(directory: string) {
@@ -114,6 +148,23 @@ export async function checkRemoteImageAlive(url: string, config: Pick<Config, 's
     }
   } catch (error) {
     return { ok: false, status: 0, error: formatError(error) }
+  }
+}
+
+async function readManifest(file: string) {
+  try {
+    return JSON.parse(await readFile(file, 'utf8'))
+  } catch {
+    return undefined
+  }
+}
+
+async function deleteIfExists(file: string) {
+  try {
+    await unlink(file)
+    return 1
+  } catch {
+    return 0
   }
 }
 

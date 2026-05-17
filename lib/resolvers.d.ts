@@ -7,11 +7,98 @@ export declare function selectReverseProvider(options: {
     providerOverride?: ReverseProvider;
     imageUrl: string;
     publicImageUrl?: string;
-    hasGoogleKey: boolean;
+    hasGoogleCredentials?: boolean;
+    hasGoogleKey?: boolean;
 }): {
     provider: ResolvedReverseProvider;
     reason: string;
 };
+export declare function diagnoseGoogleVision(config: Config): Promise<{
+    ok: boolean;
+    stage: string;
+    test: string;
+    label: string;
+    imageUrl: string | undefined;
+    status: number;
+    reason: string;
+    error: any;
+    hint: string;
+    bestGuessLabels?: undefined;
+    webEntityCount?: undefined;
+} | {
+    ok: boolean;
+    stage: string;
+    test: string;
+    label: string;
+    imageUrl: string | undefined;
+    status: number;
+    bestGuessLabels: any;
+    webEntityCount: any;
+    reason?: undefined;
+    error?: undefined;
+    hint?: undefined;
+} | {
+    ok: boolean;
+    stage: string;
+    reason: string;
+    hint: string;
+    status?: undefined;
+    tests?: undefined;
+    error?: undefined;
+} | {
+    hint: string;
+    ok: boolean;
+    stage: string;
+    test: string;
+    label: string;
+    imageUrl: string | undefined;
+    status: number;
+    bestGuessLabels: any;
+    webEntityCount: any;
+    reason?: undefined;
+    error?: undefined;
+    tests?: undefined;
+} | {
+    ok: boolean;
+    stage: string;
+    status: number;
+    reason: string;
+    tests: ({
+        ok: boolean;
+        stage: string;
+        test: string;
+        label: string;
+        imageUrl: string | undefined;
+        status: number;
+        reason: string;
+        error: any;
+        hint: string;
+        bestGuessLabels?: undefined;
+        webEntityCount?: undefined;
+    } | {
+        ok: boolean;
+        stage: string;
+        test: string;
+        label: string;
+        imageUrl: string | undefined;
+        status: number;
+        bestGuessLabels: any;
+        webEntityCount: any;
+        reason?: undefined;
+        error?: undefined;
+        hint?: undefined;
+    })[];
+    hint: string;
+    error?: undefined;
+} | {
+    ok: boolean;
+    stage: string;
+    reason: string;
+    error: string;
+    hint: string;
+    status?: undefined;
+    tests?: undefined;
+}>;
 export declare class ImageResolver {
     private ctx;
     private config;
@@ -25,13 +112,8 @@ export declare class ImageResolver {
         failures: string[];
         hint: string;
     }>;
-    private search;
     private searchDirectImages;
     private searchSerpApiImages;
-    private searchTavily;
-    private searchDuckDuckGo;
-    private extractFromPage;
-    private extractWithPuppeteer;
     private download;
     private store;
     private syncWebDav;

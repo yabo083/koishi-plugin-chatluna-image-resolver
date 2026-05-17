@@ -8,23 +8,28 @@ export interface WebDavConfig {
 }
 
 export interface Config {
+  credentials: {
+    serpApiKey: string
+    googleClientEmail: string
+    googlePrivateKey: string
+    googleProjectId: string
+    googleTokenUri: string
+    googleApiKey: string
+  }
   tool: {
     enabled: boolean
     name: string
     description: string
   }
   search: {
-    provider: 'serpapi' | 'serpapi-fallback' | 'duckduckgo' | 'tavily' | 'both'
+    provider: 'serpapi'
     serpApiKey: string
     serpApiGoogleDomain: string
     serpApiGl: string
     serpApiHl: string
     serpApiSafe: 'active' | 'off'
-    tavilyApiKey: string
     maxSearchResults: number
-    maxPages: number
     pageTimeoutMs: number
-    usePuppeteerFallback: boolean
   }
   image: {
     maxCount: number
@@ -42,6 +47,7 @@ export interface Config {
     serpApiKey: string
     serpApiGoogleDomain: string
     googleApiKey: string
+    googleServiceAccountJson: string
     maxResults: number
     publicBaseUrl: string
     customPrompt: string
@@ -60,19 +66,110 @@ export interface Config {
     localDirectory: string
     localPublicPath: string
     retentionDays: number
+    expiredRetentionDays: number
     cleanupIntervalHours: number
   }
   delivery: {
     publicBaseUrl: string
   }
+  network: {
+    useChatLunaProxy: boolean
+  }
   webdav: WebDavConfig
   debug: boolean
 }
 
-export interface SearchResult {
-  title: string
-  url: string
-  snippet?: string
+export interface ConfigInput {
+  credentials?: Partial<Config['credentials']> & {
+    googleServiceAccountJson?: string
+  }
+  features?: {
+    tool?: Partial<Config['tool']>
+    reverse?: Pick<Config['reverse'], 'enabled' | 'toolName' | 'description'>
+    qqMedia?: Pick<Config['qqMedia'], 'enabled' | 'toolName' | 'description'>
+    toolEnabled?: boolean
+    toolName?: string
+    toolDescription?: string
+    reverseEnabled?: boolean
+    reverseToolName?: string
+    reverseDescription?: string
+    qqMediaEnabled?: boolean
+    qqMediaToolName?: string
+    qqMediaDescription?: string
+  }
+  textSearch?: {
+    api?: Partial<Config['search']>
+    imageProcessing?: Pick<Partial<Config['image']>, 'maxCount' | 'minWidth' | 'minHeight'>
+    provider?: 'serpapi'
+    serpApiKey?: string
+    serpApiGoogleDomain?: string
+    serpApiGl?: string
+    serpApiHl?: string
+    serpApiSafe?: 'active' | 'off'
+    maxSearchResults?: number
+    maxCount?: number
+    minWidth?: number
+    minHeight?: number
+  }
+  reverseSearch?: {
+    provider?: Pick<Partial<Config['reverse']>, 'provider' | 'serpApiKey' | 'serpApiGoogleDomain' | 'googleApiKey' | 'googleServiceAccountJson'>
+      | Config['reverse']['provider']
+    serpApiKey?: string
+    serpApiGoogleDomain?: string
+    googleApiKey?: string
+    googleServiceAccountJson?: string
+    maxResults?: number
+    publicBaseUrl?: string
+    customPrompt?: string
+    behavior?: Pick<Partial<Config['reverse']>, 'maxResults' | 'publicBaseUrl' | 'customPrompt'>
+  }
+  qqMedia?: {
+    tracking?: Pick<Partial<Config['qqMedia']>, 'maxTrackedMessages'>
+    cache?: Pick<Partial<Config['qqMedia']>, 'cacheOnResolve' | 'textPreviewBytes'>
+    maxTrackedMessages?: number
+    cacheOnResolve?: boolean
+    textPreviewBytes?: number
+  }
+  storage?: {
+    cache?: {
+      ttlHours?: number
+      localFallback?: boolean
+      localDirectory?: string
+      localPublicPath?: string
+      expiredRetentionHours?: number
+      cleanupIntervalHours?: number
+    }
+    delivery?: Partial<Config['delivery']>
+    webdav?: Partial<WebDavConfig>
+    ttlHours?: number
+    localFallback?: boolean
+    localDirectory?: string
+    localPublicPath?: string
+    expiredRetentionHours?: number
+    cleanupIntervalHours?: number
+    publicBaseUrl?: string
+    webdavEnabled?: boolean
+    webdavEndpoint?: string
+    webdavUsername?: string
+    webdavPassword?: string
+    webdavBasePath?: string
+    webdavPublicBaseUrl?: string
+  }
+  http?: {
+    userAgent?: string
+    timeoutMs?: number
+    limits?: {
+      imageBytes?: number
+      mediaBytes?: number
+    }
+    imageBytes?: number
+    mediaBytes?: number
+  }
+  debugging?: {
+    network?: Partial<Config['network']>
+    useChatLunaProxy?: boolean
+    logging?: boolean
+  }
 }
 
 export interface ImageCandidate {

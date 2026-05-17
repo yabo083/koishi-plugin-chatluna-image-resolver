@@ -2,12 +2,14 @@ import type { Context } from 'koishi';
 import type { Config, TrackedMediaKind, WebDavConfig } from './types';
 export declare function cleanupManagedImageCache(directory: string, options: {
     retentionDays: number;
+    expiredRetentionDays?: number;
     now?: number;
 }): Promise<{
     scanned: number;
     deleted: number;
     skipped: number;
 }>;
+export declare function markManagedCacheEntryExpired(directory: string, manifestName: string, check: Record<string, unknown>, now?: number): Promise<any>;
 export declare function listManagedImageCache(directory: string): Promise<{
     items: any[];
 }>;
