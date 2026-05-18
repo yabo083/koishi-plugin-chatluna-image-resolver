@@ -1,11 +1,41 @@
 import type { Config, QQImageRecord, TrackedMediaKind } from './types'
 import { clamp, trackedMediaFromElement } from './utils'
 
+export interface SessionContext {
+  userId: string
+  channelId: string
+  guildId: string
+  platform: string
+  timestamp: number
+}
+
 export class QQImageTracker {
   private records: QQImageRecord[] = []
   private byMessageId = new Map<string, QQImageRecord>()
+  private sessionByChannel = new Map<string, SessionContext>()
 
   constructor(private config: Config) {}
+
+  rememberSession(session: any) {
+    const channelId = String(session?.channelId || '').trim()
+    if (!channelId) return
+    this.sessionByChannel.set(channelId, {
+      userId: String(session?.userId || ''),
+      channelId,
+      guildId: String(session?.guildId || ''),
+      platform: String(session?.platform || session?.event?.platform || ''),
+      timestamp: Date.now()
+    })
+  }
+
+  getSessionContext(channelId?: string): SessionContext | undefined {
+    if (channelId) return this.sessionByChannel.get(channelId)
+    let latest: SessionContext | undefined
+    for (const ctx of this.sessionByChannel.values()) {
+      if (!latest || ctx.timestamp > latest.timestamp) latest = ctx
+    }
+    return latest
+  }
 
   remember(session: any) {
     const messageId = String(session?.messageId || session?.event?.message?.id || session?.event?.message?.messageId || '').trim()

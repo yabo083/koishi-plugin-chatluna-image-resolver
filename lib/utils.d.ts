@@ -57,7 +57,9 @@ export declare function attachReverseNote<T extends GoogleReverseResult | SerpAp
 export declare function pushCandidate(out: ImageCandidate[], value: string, pageUrl: string, reason: string, width?: number, height?: number): void;
 export declare function candidatesFromRawImage(raw: any, pageUrl: string): ImageCandidate[];
 export declare function scoreCandidate(candidate: ImageCandidate, config: Config, safeMode: boolean): ImageCandidate;
-export declare function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response>;
+export declare function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, options?: {
+    noProxy?: boolean;
+}): Promise<Response>;
 export declare function configureFetchProxy(proxyOverride?: string): void;
 export declare function decodeDuckUrl(url: string): string;
 export declare function absolutizeUrl(raw: string, base: string): string;

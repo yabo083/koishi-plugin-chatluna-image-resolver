@@ -65,33 +65,6 @@
   </aside>
 
   <div v-if="isOwn" class="miyako-media-page">
-    <section class="miyako-media-guide" aria-label="用户指南">
-      <div class="miyako-media-guide__intro">
-        <strong>快速指南</strong>
-        <p>这个插件给 ChatLuna 提供以文搜图、以图搜图、QQ 图片/语音/文件直链解析，以及本地缓存托管。多数配置保持默认即可，通常只需要先填写 API 凭据。</p>
-      </div>
-      <div class="miyako-media-guide__steps">
-        <span>1. SerpApi Key 只在 API 凭据里填一次</span>
-        <span>2. Google Vision 只需服务账号 client_email 与 private_key</span>
-        <span>3. 其余搜索、缓存、HTTP 参数默认适合常规使用</span>
-      </div>
-    </section>
-
-    <header class="miyako-media-page__hero">
-      <div>
-        <h3>ChatLuna 媒体解析器</h3>
-        <p>以文搜图工具、以图搜图工具、qq多媒体直链解析工具与统一缓存</p>
-      </div>
-      <div class="miyako-media-page__actions">
-        <button type="button" class="miyako-media-cache__button" @click="diagnoseVision" :disabled="visionChecking">
-          {{ visionChecking ? '检测中' : '检测 Google Vision' }}
-        </button>
-        <button type="button" class="miyako-media-cache__button is-primary" @click="loadCache" :disabled="loading">
-          {{ loading ? '刷新中' : '刷新缓存' }}
-        </button>
-      </div>
-    </header>
-
     <section v-if="visionResult" :class="['miyako-media-diagnostic', visionResult.ok ? 'is-ok' : 'is-bad']">
       <strong>{{ visionResult.ok ? 'Google Vision 可用' : 'Google Vision 不可用' }}</strong>
       <span>{{ visionResult.hint || visionResult.error || visionResult.reason }}</span>
@@ -105,98 +78,6 @@
           <span>{{ test.ok ? `HTTP ${test.status}` : test.error || test.reason }}</span>
         </div>
       </div>
-    </section>
-
-    <section class="miyako-media-cache" data-panel-section="cache">
-      <header class="miyako-media-cache__header">
-      <div>
-        <h3>资源缓存</h3>
-        <p>图片、语音和文本文件的按需转存记录</p>
-      </div>
-      <button type="button" class="miyako-media-cache__button is-primary" @click="loadCache" :disabled="loading">
-        {{ loading ? '刷新中' : '刷新' }}
-      </button>
-      </header>
-
-    <section class="miyako-media-cache__summary" aria-label="缓存概览">
-      <div>
-        <strong>{{ items.length }}</strong>
-        <span>条记录</span>
-      </div>
-      <div>
-        <strong>{{ formatBytes(totalBytes) }}</strong>
-        <span>已管理</span>
-      </div>
-      <div>
-        <strong>{{ latestTime }}</strong>
-        <span>最近写入</span>
-      </div>
-    </section>
-
-    <nav class="miyako-media-cache__filters" aria-label="资源类型筛选">
-      <button
-        v-for="option in filterOptions"
-        :key="option.value"
-        type="button"
-        :class="['miyako-media-cache__filter', activeKind === option.value && 'is-active']"
-        @click="activeKind = option.value"
-      >
-        <span>{{ option.label }}</span>
-        <small>{{ option.count }}</small>
-      </button>
-    </nav>
-
-    <div v-if="error" class="miyako-media-cache__notice">{{ error }}</div>
-
-    <div v-if="!filteredItems.length && !loading" class="miyako-media-cache__empty">
-      暂无匹配的本地缓存资源
-    </div>
-
-    <div v-else class="miyako-media-cache__table">
-      <article v-for="item in filteredItems" :key="item.manifest || item.filename" class="miyako-media-cache__row">
-        <a v-if="item.url && kindOf(item) === 'image'" class="miyako-media-cache__thumb" :href="item.url" target="_blank" rel="noreferrer">
-          <img :src="item.url" alt="" loading="lazy">
-        </a>
-        <a v-else-if="item.url" class="miyako-media-cache__file" :href="item.url" target="_blank" rel="noreferrer">
-          {{ kindLabel(kindOf(item)).slice(0, 1) }}
-        </a>
-        <div v-else class="miyako-media-cache__file">
-          {{ kindLabel(kindOf(item)).slice(0, 1) }}
-        </div>
-
-        <div class="miyako-media-cache__main">
-          <div class="miyako-media-cache__title-line">
-            <strong>{{ item.filename || '未命名资源' }}</strong>
-            <span>{{ kindLabel(kindOf(item)) }}</span>
-          </div>
-          <div class="miyako-media-cache__meta">
-            <span>{{ formatBytes(item.bytes) }}</span>
-            <span>{{ item.mime || 'unknown' }}</span>
-            <span>{{ formatTime(item.createdAt || item.mtime) }}</span>
-          </div>
-          <a v-if="item.originalUrl" class="miyako-media-cache__link" :href="item.originalUrl" target="_blank" rel="noreferrer">
-            {{ item.originalUrl }}
-          </a>
-          <div v-if="item.sourcePage" class="miyako-media-cache__source">
-            {{ item.sourcePage }}
-          </div>
-        </div>
-
-        <div class="miyako-media-cache__actions">
-          <button
-            type="button"
-            class="miyako-media-cache__button"
-            :disabled="!item.originalUrl || checking[item.originalUrl]"
-            @click="checkAlive(item)"
-          >
-            {{ checking[item.originalUrl] ? '检测中' : '检测直链' }}
-          </button>
-          <span v-if="item.originalUrlExpired || checks[item.originalUrl]" :class="['miyako-media-cache__status', checks[item.originalUrl]?.ok ? 'is-ok' : 'is-bad']">
-            {{ checks[item.originalUrl]?.ok ? '可访问' : `已过期 ${checks[item.originalUrl]?.status || item.originalUrlLastCheck?.status || ''}` }}
-          </span>
-        </div>
-      </article>
-    </div>
     </section>
   </div>
 </template>
@@ -677,78 +558,6 @@ function syncPanelClass(enabled: boolean) {
   padding: 18px 0 4px;
 }
 
-.miyako-media-guide {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(260px, .82fr);
-  gap: 14px;
-  margin-bottom: 18px;
-  padding: 14px 0 16px;
-  border-bottom: 1px solid var(--k-color-divider, #ebeef5);
-}
-
-.miyako-media-guide__intro {
-  min-width: 0;
-}
-
-.miyako-media-guide__intro strong {
-  display: block;
-  font-size: 16px;
-  line-height: 1.4;
-}
-
-.miyako-media-guide__intro p {
-  margin: 5px 0 0;
-  color: var(--k-text-light);
-  font-size: 13px;
-  line-height: 1.65;
-}
-
-.miyako-media-guide__steps {
-  display: grid;
-  align-content: start;
-  gap: 6px;
-  min-width: 0;
-}
-
-.miyako-media-guide__steps span {
-  display: block;
-  min-width: 0;
-  padding: 6px 9px;
-  border-left: 3px solid var(--k-color-primary);
-  border-radius: 0 6px 6px 0;
-  background: var(--k-hover-bg);
-  color: var(--k-text-normal);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.miyako-media-page__hero {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--k-color-divider, #ebeef5);
-}
-
-.miyako-media-page__actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
-}
-
-.miyako-media-page__hero h3 {
-  margin: 0;
-  font-size: 18px;
-  line-height: 1.35;
-}
-
-.miyako-media-page__hero p {
-  margin: 5px 0 0;
-  color: var(--k-text-light);
-  font-size: 12px;
-}
 
 .miyako-media-nav {
   position: absolute;
@@ -1257,16 +1066,6 @@ function syncPanelClass(enabled: boolean) {
 }
 
 @media (max-width: 720px) {
-  .miyako-media-guide {
-    grid-template-columns: 1fr;
-  }
-
-  .miyako-media-cache__header {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .miyako-media-page__hero,
   .miyako-media-page__actions {
     align-items: stretch;
     flex-direction: column;

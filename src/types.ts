@@ -43,7 +43,7 @@ export interface Config {
     enabled: boolean
     toolName: string
     description: string
-    provider: 'auto' | 'serpapi' | 'serpapi-lens' | 'google'
+    provider: 'auto' | 'serpapi-lens' | 'google'
     serpApiKey: string
     serpApiGoogleDomain: string
     googleApiKey: string
@@ -71,6 +71,7 @@ export interface Config {
     cleanupIntervalMinutes: number
     livenessCheckBatchSize: number
     cleanupIntervalHours: number
+    autoRevive: boolean
   }
   delivery: {
     publicBaseUrl: string
@@ -144,6 +145,7 @@ export interface ConfigInput {
       cleanupIntervalMinutes?: number
       livenessCheckBatchSize?: number
       cleanupIntervalHours?: number
+      autoRevive?: boolean
     }
     delivery?: Partial<Config['delivery']>
     webdav?: Partial<WebDavConfig>

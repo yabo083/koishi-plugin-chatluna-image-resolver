@@ -269,12 +269,14 @@ export function scoreCandidate(candidate: ImageCandidate, config: Config, safeMo
   return { ...candidate, url, score }
 }
 
-export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
-  configureFetchProxy()
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, options?: { noProxy?: boolean }) {
+  if (!options?.noProxy) configureFetchProxy()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    const fetchOptions: any = { ...init, signal: controller.signal }
+    if (options?.noProxy) fetchOptions.dispatcher = undefined
+    return await fetch(url, fetchOptions)
   } finally {
     clearTimeout(timer)
   }

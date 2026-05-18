@@ -16,14 +16,22 @@ export declare function listManagedImageCache(directory: string): Promise<{
     items: any[];
 }>;
 export declare function findManagedCacheByOriginalUrl(directory: string, originalUrl: string): Promise<any>;
+export declare function findManagedCacheByCachedUrl(directory: string, cachedUrl: string): Promise<any>;
+export declare function searchManagedCache(directory: string, query: string, limit?: number): Promise<any[]>;
 export declare function sweepManagedCacheOriginalUrls(directory: string, config: Config, options?: {
     maxChecks?: number;
     minCheckIntervalMinutes?: number;
     now?: number;
+    onRevive?: (item: any, downloaded: {
+        buffer: Buffer;
+        mime: string;
+        filename: string;
+    }) => Promise<void>;
 }): Promise<{
     checked: number;
     expired: number;
     refreshed: number;
+    revived: number;
     remaining: number;
 }>;
 export declare function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>): Promise<{
@@ -61,3 +69,4 @@ export declare function downloadMediaFromUrl(url: string, config: Config, option
 export declare function isManagedCacheFilename(filename: string): boolean;
 export declare function readJsonBody(koa: any): Promise<any>;
 export declare function ensureWebDavCollections(cfg: WebDavConfig, basePath: string, timeoutMs: number): Promise<void>;
+export declare function writeManagedAssetManifest(ctx: Context, config: Config, filename: string, publicUrl: string, mime: string, bytes: number, metadata: Record<string, unknown>): Promise<void>;

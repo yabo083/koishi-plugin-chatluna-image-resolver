@@ -142,10 +142,32 @@ export async function findManagedCacheByOriginalUrl(directory: string, originalU
   return items.find((item) => item.originalUrl === originalUrl && item.url && !item.originalUrlExpired)
 }
 
+export async function findManagedCacheByCachedUrl(directory: string, cachedUrl: string) {
+  if (!cachedUrl) return undefined
+  const { items } = await listManagedImageCache(directory)
+  return items.find((item) => item.url === cachedUrl && !item.originalUrlExpired)
+}
+
+export async function searchManagedCache(directory: string, query: string, limit = 10) {
+  if (!query) return []
+  const { items } = await listManagedImageCache(directory)
+  const q = query.toLowerCase()
+  return items
+    .filter((item) => {
+      if (item.originalUrlExpired) return false
+      const url = String(item.url || '').toLowerCase()
+      const orig = String(item.originalUrl || '').toLowerCase()
+      const source = String(item.sourcePage || '').toLowerCase()
+      const file = String(item.filename || '').toLowerCase()
+      return url.includes(q) || orig.includes(q) || source.includes(q) || file.includes(q)
+    })
+    .slice(0, Math.max(1, limit))
+}
+
 export async function sweepManagedCacheOriginalUrls(
   directory: string,
   config: Config,
-  options: { maxChecks?: number; minCheckIntervalMinutes?: number; now?: number } = {}
+  options: { maxChecks?: number; minCheckIntervalMinutes?: number; now?: number; onRevive?: (item: any, downloaded: { buffer: Buffer; mime: string; filename: string }) => Promise<void> } = {}
 ) {
   const now = options.now ?? Date.now()
   const maxChecks = Math.max(1, Math.floor(options.maxChecks ?? config.storage.livenessCheckBatchSize ?? 12))
@@ -167,6 +189,7 @@ export async function sweepManagedCacheOriginalUrls(
   let checked = 0
   let expired = 0
   let refreshed = 0
+  let revived = 0
   for (const item of candidates) {
     const result = await checkRemoteImageAlive(String(item.originalUrl), config)
     checked++
@@ -176,9 +199,35 @@ export async function sweepManagedCacheOriginalUrls(
     } else {
       await markManagedCacheEntryChecked(directory, item.manifest, result, now)
       refreshed++
+      if (config.storage.autoRevive && item.filename) {
+        const assetMissing = await isAssetMissing(directory, item)
+        if (assetMissing) {
+          try {
+            const kind = detectManagedAssetKind(item.filename, item.mime || '')
+            const downloaded = await downloadMediaFromUrl(String(item.originalUrl), config, { kind })
+            if (options.onRevive) {
+              await options.onRevive(item, downloaded)
+            } else {
+              await mkdir(directory, { recursive: true })
+              await writeFile(join(directory, item.filename), downloaded.buffer)
+            }
+            revived++
+          } catch {}
+        }
+      }
     }
   }
-  return { checked, expired, refreshed, remaining: Math.max(0, items.length - candidates.length) }
+  return { checked, expired, refreshed, revived, remaining: Math.max(0, items.length - candidates.length) }
+}
+
+async function isAssetMissing(directory: string, item: any): Promise<boolean> {
+  if (!item.filename) return false
+  try {
+    await stat(join(directory, item.filename))
+    return false
+  } catch {
+    return true
+  }
 }
 
 export async function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>) {
@@ -244,18 +293,6 @@ export async function storeManagedImage(ctx: Context, config: Config, buffer: Bu
 }
 
 export async function storeManagedAsset(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: Record<string, unknown> = {}) {
-  if (ctx.chatluna_storage?.createTempFile) {
-    const stored = await ctx.chatluna_storage.createTempFile(buffer, filename, config.image.tempExpireHours, mime)
-    const publicUrl = rewriteUrlBase(stored.url, config.delivery.publicBaseUrl)
-    await writeManagedAssetManifest(ctx, config, filename, publicUrl, mime, buffer.length, {
-      storage: 'chatluna-storage',
-      ...metadata
-    }).catch((error) => ctx.logger(loggerName).warn('write media cache manifest failed: %s', formatError(error)))
-    return publicUrl
-  }
-  if (!config.storage.localFallback) {
-    throw new Error('chatluna-storage-service is not available and local fallback is disabled')
-  }
   const dir = join(ctx.baseDir, config.storage.localDirectory)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, filename), buffer)
@@ -331,7 +368,7 @@ export async function ensureWebDavCollections(cfg: WebDavConfig, basePath: strin
   }
 }
 
-async function writeManagedAssetManifest(ctx: Context, config: Config, filename: string, publicUrl: string, mime: string, bytes: number, metadata: Record<string, unknown>) {
+export async function writeManagedAssetManifest(ctx: Context, config: Config, filename: string, publicUrl: string, mime: string, bytes: number, metadata: Record<string, unknown>) {
   const dir = join(ctx.baseDir, config.storage.localDirectory)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, `${filename}.json`), JSON.stringify({

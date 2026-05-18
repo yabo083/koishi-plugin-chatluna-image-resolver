@@ -147,17 +147,35 @@ test('selects reverse provider for public QQ CDN and private cached URLs', () =>
     hasGoogleKey: true
   }).provider, 'google')
 
+  // legacy 'serpapi' maps to 'serpapi-lens'
   assert.deepEqual(selectReverseProvider({
     configuredProvider: 'serpapi',
     imageUrl: 'http://127.0.0.1:5140/chatluna-storage/temp/a.png',
     hasGoogleKey: true
-  }).provider, 'google')
+  }).provider, 'serpapi-lens')
 
   assert.deepEqual(selectReverseProvider({
     configuredProvider: 'serpapi',
     imageUrl: 'https://cdn.example.test/a.png',
     hasGoogleKey: true
-  }).provider, 'serpapi')
+  }).provider, 'serpapi-lens')
+
+  // fallback is always set when both providers are available
+  const autoPrivate = selectReverseProvider({
+    configuredProvider: 'auto',
+    imageUrl: 'http://127.0.0.1:5140/a.png',
+    hasGoogleKey: true
+  })
+  assert.equal(autoPrivate.provider, 'google')
+  assert.equal(autoPrivate.fallback, 'serpapi-lens')
+
+  const lensExplicit = selectReverseProvider({
+    configuredProvider: 'serpapi-lens',
+    imageUrl: 'https://cdn.example.test/a.png',
+    hasGoogleKey: true
+  })
+  assert.equal(lensExplicit.provider, 'serpapi-lens')
+  assert.equal(lensExplicit.fallback, 'google')
 })
 
 test('rewrites ChatLuna storage URLs before sending them to public-only providers', () => {
@@ -384,12 +402,13 @@ test('sweeps original URLs in bounded batches and marks dead cache entries', asy
   }
 })
 
-test('writes a visible manifest when storing through ChatLuna storage', async () => {
+test('writes a visible manifest when storing to local directory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'media-resolver-storage-'))
   const config = {
     image: { tempExpireHours: 168 },
     storage: {
       localDirectory: 'cache',
+      localPublicPath: '/chatluna-image-resolver',
       retentionDays: 7
     },
     delivery: {
@@ -398,17 +417,9 @@ test('writes a visible manifest when storing through ChatLuna storage', async ()
   }
   const ctx = {
     baseDir: root,
+    server: { selfUrl: 'http://127.0.0.1:5140' },
     logger() {
       return { warn() {} }
-    },
-    chatluna_storage: {
-      async createTempFile(buffer, filename, expireHours, mime) {
-        assert.equal(buffer.toString('utf8'), 'voice')
-        assert.equal(filename, 'resolved-audio-voice.silk')
-        assert.equal(expireHours, 168)
-        assert.equal(mime, 'audio/silk')
-        return { url: 'http://127.0.0.1:5140/chatluna-storage/temp/resolved-audio-voice.silk' }
-      }
     }
   }
 
@@ -417,10 +428,12 @@ test('writes a visible manifest when storing through ChatLuna storage', async ()
     originalUrl: 'https://multimedia.nt.qq.com.cn/download?fileid=voice'
   })
 
-  assert.equal(url, 'https://bot.example.test/chatluna-storage/temp/resolved-audio-voice.silk')
+  assert.equal(url, 'https://bot.example.test/chatluna-image-resolver/resolved-audio-voice.silk')
   const manifest = JSON.parse(await readFile(join(root, 'cache', 'resolved-audio-voice.silk.json'), 'utf8'))
   assert.equal(manifest.kind, 'audio')
-  assert.equal(manifest.storage, 'chatluna-storage')
+  assert.equal(manifest.storage, 'local')
   assert.equal(manifest.url, url)
   assert.equal(manifest.bytes, 5)
+  const fileContent = await readFile(join(root, 'cache', 'resolved-audio-voice.silk'), 'utf8')
+  assert.equal(fileContent, 'voice')
 })

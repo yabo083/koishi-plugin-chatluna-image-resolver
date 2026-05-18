@@ -1,5 +1,6 @@
 import { Context } from 'koishi';
 import type { Config, StoredImage } from './types';
+import type { SessionContext } from './tracker';
 export type ReverseProvider = Config['reverse']['provider'];
 export type ResolvedReverseProvider = Exclude<ReverseProvider, 'auto'>;
 export declare function selectReverseProvider(options: {
@@ -11,6 +12,7 @@ export declare function selectReverseProvider(options: {
     hasGoogleKey?: boolean;
 }): {
     provider: ResolvedReverseProvider;
+    fallback?: ResolvedReverseProvider;
     reason: string;
 };
 export declare function diagnoseGoogleVision(config: Config): Promise<{
@@ -102,7 +104,8 @@ export declare function diagnoseGoogleVision(config: Config): Promise<{
 export declare class ImageResolver {
     private ctx;
     private config;
-    constructor(ctx: Context, config: Config);
+    private session?;
+    constructor(ctx: Context, config: Config, session?: SessionContext | undefined);
     resolve(query: string, count: number, safeMode: boolean): Promise<{
         ok: boolean;
         query: string;
@@ -121,7 +124,8 @@ export declare class ImageResolver {
 export declare class ReverseImageResolver {
     private ctx;
     private config;
-    constructor(ctx: Context, config: Config);
+    private session?;
+    constructor(ctx: Context, config: Config, session?: SessionContext | undefined);
     resolve(imageUrl: string, providerOverride?: ReverseProvider, maxResultsOverride?: number): Promise<{
         selectedProviderReason: string;
         cachedInputUrl: string | undefined;
@@ -131,24 +135,8 @@ export declare class ReverseImageResolver {
         note: string;
         ok: true;
         error?: undefined;
-        hint?: undefined;
-    } | {
-        selectedProviderReason: string;
-        cachedInputUrl: string | undefined;
-        provider: "serpapi";
-        imageUrl: string;
-        searchInformation?: unknown;
-        imageResults: Array<{
-            position?: number;
-            title?: string;
-            link?: string;
-            source?: string;
-            thumbnail?: string;
-            original?: string;
-        }>;
-        note: string;
-        ok: true;
-        error?: undefined;
+        fallbackProvider?: undefined;
+        fallbackError?: undefined;
         hint?: undefined;
     } | {
         selectedProviderReason: string;
@@ -176,6 +164,8 @@ export declare class ReverseImageResolver {
         note: string;
         ok: true;
         error?: undefined;
+        fallbackProvider?: undefined;
+        fallbackError?: undefined;
         hint?: undefined;
     } | {
         ok: boolean;
@@ -183,7 +173,18 @@ export declare class ReverseImageResolver {
         imageUrl: string;
         selectedProviderReason: string;
         error: string;
+        fallbackProvider: ResolvedReverseProvider;
+        fallbackError: string;
         hint: string;
+    } | {
+        ok: boolean;
+        provider: ResolvedReverseProvider;
+        imageUrl: string;
+        selectedProviderReason: string;
+        error: string;
+        hint: string;
+        fallbackProvider?: undefined;
+        fallbackError?: undefined;
     }>;
     private callSerpApi;
     private callSerpApiLens;
