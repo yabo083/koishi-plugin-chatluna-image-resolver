@@ -5,78 +5,61 @@ const { tmpdir } = require('node:os')
 const test = require('node:test')
 
 const {
-  buildGoogleVisionWebDetectionRequest,
-  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
-  buildSerpApiReverseImageUrl,
   cleanupManagedImageCache,
+  computeAspectRatio,
+  computeOrientation,
+  detectIsAnimated,
   detectManagedAssetKind,
+  extractPageTitle,
+  extractTagsFromQuery,
+  generateBatchId,
   isPublicHttpUrl,
   isManagedCacheFilename,
-  markManagedCacheEntryExpired,
   mimeFromFilename,
   rewriteImageUrlForPublicAccess,
-  selectReverseProvider,
+  serpApiImagesToCandidates,
   serpApiLensPayloadToResult,
-  sweepManagedCacheOriginalUrls,
   storeManagedAsset
 } = require('../lib/index.js')
 
-test('builds Google Vision web detection request with downloaded image bytes as base64', () => {
-  const body = buildGoogleVisionWebDetectionRequest(Buffer.from('image-bytes'), 7)
+test('S3 image bed upload preserves path prefixes as object directories', async () => {
+  const oldFetch = global.fetch
+  let requestedUrl = ''
+  global.fetch = async (url, init) => {
+    requestedUrl = String(url)
+    assert.equal(init.method, 'PUT')
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      text: async () => ''
+    }
+  }
+  try {
+    const { uploadToImageBed } = require('../lib/imagebed.js')
+    const result = await uploadToImageBed(Buffer.from('image'), 'resolved-image-demo.png', 'image/png', {
+      imageBedProvider: 's3',
+      s3Endpoint: 'https://s3.example.test',
+      s3Region: 'us-east-1',
+      s3Bucket: 'bucket',
+      s3AccessKeyId: 'key',
+      s3SecretAccessKey: 'secret',
+      s3PathPrefix: 'chatluna-images/reverse',
+      s3PublicUrl: 'https://cdn.example.test/chatluna-images/reverse',
+      webdavEndpoint: '',
+      webdavUsername: '',
+      webdavPassword: '',
+      webdavBasePath: '',
+      webdavPublicUrl: ''
+    }, 1000)
 
-  assert.deepEqual(body, {
-    requests: [
-      {
-        image: {
-          content: Buffer.from('image-bytes').toString('base64')
-        },
-        features: [
-          {
-            type: 'WEB_DETECTION',
-            maxResults: 7
-          }
-        ]
-      }
-    ]
-  })
-})
-
-test('builds Google Vision web detection request with a public image URI', () => {
-  const body = buildGoogleVisionWebDetectionUriRequest('https://example.test/image.jpg', 3)
-
-  assert.deepEqual(body, {
-    requests: [
-      {
-        image: {
-          source: {
-            imageUri: 'https://example.test/image.jpg'
-          }
-        },
-        features: [
-          {
-            type: 'WEB_DETECTION',
-            maxResults: 3
-          }
-        ]
-      }
-    ]
-  })
-})
-
-test('builds SerpApi Google reverse image URL compatible with the official playground', () => {
-  const url = new URL(buildSerpApiReverseImageUrl({
-    apiKey: 'serp-key',
-    imageUrl: 'https://static.zerochan.net/Tendou.Alice.full.3860632.jpg',
-    googleDomain: 'google.com'
-  }))
-
-  assert.equal(url.origin, 'https://serpapi.com')
-  assert.equal(url.pathname, '/search.json')
-  assert.equal(url.searchParams.get('engine'), 'google_reverse_image')
-  assert.equal(url.searchParams.get('api_key'), 'serp-key')
-  assert.equal(url.searchParams.get('google_domain'), 'google.com')
-  assert.equal(url.searchParams.get('image_url'), 'https://static.zerochan.net/Tendou.Alice.full.3860632.jpg')
+    assert.equal(requestedUrl, 'https://s3.example.test/bucket/chatluna-images/reverse/resolved-image-demo.png')
+    assert.equal(result.ok, true)
+    assert.equal(result.publicUrl, 'https://cdn.example.test/chatluna-images/reverse/resolved-image-demo.png')
+  } finally {
+    global.fetch = oldFetch
+  }
 })
 
 test('builds SerpApi Google Lens URL for QQ CDN visual matches', () => {
@@ -134,50 +117,6 @@ test('validates whether an image URL is public enough for URL-based reverse prov
   assert.equal(isPublicHttpUrl('http://koishi/image.png'), false)
 })
 
-test('selects reverse provider for public QQ CDN and private cached URLs', () => {
-  assert.deepEqual(selectReverseProvider({
-    configuredProvider: 'auto',
-    imageUrl: 'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc',
-    hasGoogleKey: true
-  }).provider, 'serpapi-lens')
-
-  assert.deepEqual(selectReverseProvider({
-    configuredProvider: 'auto',
-    imageUrl: 'http://127.0.0.1:5140/chatluna-storage/temp/a.png',
-    hasGoogleKey: true
-  }).provider, 'google')
-
-  // legacy 'serpapi' maps to 'serpapi-lens'
-  assert.deepEqual(selectReverseProvider({
-    configuredProvider: 'serpapi',
-    imageUrl: 'http://127.0.0.1:5140/chatluna-storage/temp/a.png',
-    hasGoogleKey: true
-  }).provider, 'serpapi-lens')
-
-  assert.deepEqual(selectReverseProvider({
-    configuredProvider: 'serpapi',
-    imageUrl: 'https://cdn.example.test/a.png',
-    hasGoogleKey: true
-  }).provider, 'serpapi-lens')
-
-  // fallback is always set when both providers are available
-  const autoPrivate = selectReverseProvider({
-    configuredProvider: 'auto',
-    imageUrl: 'http://127.0.0.1:5140/a.png',
-    hasGoogleKey: true
-  })
-  assert.equal(autoPrivate.provider, 'google')
-  assert.equal(autoPrivate.fallback, 'serpapi-lens')
-
-  const lensExplicit = selectReverseProvider({
-    configuredProvider: 'serpapi-lens',
-    imageUrl: 'https://cdn.example.test/a.png',
-    hasGoogleKey: true
-  })
-  assert.equal(lensExplicit.provider, 'serpapi-lens')
-  assert.equal(lensExplicit.fallback, 'google')
-})
-
 test('rewrites ChatLuna storage URLs before sending them to public-only providers', () => {
   assert.equal(
     rewriteImageUrlForPublicAccess(
@@ -218,7 +157,7 @@ test('cleans only managed cached image files older than retention window', async
   await require('node:fs/promises').utimes(freshImage, oneDayAgo / 1000, oneDayAgo / 1000)
   await require('node:fs/promises').utimes(unmanagedOld, eightDaysAgo / 1000, eightDaysAgo / 1000)
 
-  const summary = await cleanupManagedImageCache(root, {
+  const summary = await cleanupManagedImageCache(undefined, root, {
     retentionDays: 7,
     now
   })
@@ -267,7 +206,7 @@ test('cleans managed media cache artifacts older than retention window', async (
   }
   await require('node:fs/promises').utimes(freshPdf, oneDayAgo / 1000, oneDayAgo / 1000)
 
-  const summary = await cleanupManagedImageCache(root, {
+  const summary = await cleanupManagedImageCache(undefined, root, {
     retentionDays: 7,
     now
   })
@@ -278,128 +217,6 @@ test('cleans managed media cache artifacts older than retention window', async (
   await assert.rejects(() => stat(oldTextManifest))
   assert.equal(await readFile(freshPdf, 'utf8'), 'fresh-pdf')
   assert.equal(await readFile(unmanagedOld, 'utf8'), 'manual')
-})
-
-test('marks expired original URLs in manifests and removes them after the expired retention window', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'media-resolver-expired-'))
-  await mkdir(root, { recursive: true })
-  const image = join(root, 'resolved-image-dead.jpg')
-  const manifest = join(root, 'resolved-image-dead.jpg.json')
-  await writeFile(image, 'image')
-  await writeFile(manifest, JSON.stringify({
-    filename: 'resolved-image-dead.jpg',
-    url: '/chatluna-image-resolver/resolved-image-dead.jpg',
-    originalUrl: 'https://cdn.example.test/dead.jpg',
-    createdAt: new Date('2026-05-01T00:00:00.000Z').toISOString()
-  }, null, 2))
-
-  await markManagedCacheEntryExpired(root, 'resolved-image-dead.jpg.json', {
-    ok: false,
-    status: 404,
-    error: 'not found'
-  }, Date.parse('2026-05-10T00:00:00.000Z'))
-
-  const updated = JSON.parse(await readFile(manifest, 'utf8'))
-  assert.equal(updated.originalUrlExpired, true)
-  assert.equal(updated.originalUrlLastCheck.ok, false)
-  assert.equal(updated.originalUrlLastCheck.status, 404)
-  assert.equal(updated.originalUrlExpiredAt, '2026-05-10T00:00:00.000Z')
-
-  const summary = await cleanupManagedImageCache(root, {
-    retentionDays: 30,
-    expiredRetentionDays: 1,
-    now: Date.parse('2026-05-12T00:00:00.000Z')
-  })
-
-  assert.equal(summary.deleted, 2)
-  await assert.rejects(() => stat(image))
-  await assert.rejects(() => stat(manifest))
-})
-
-test('removes expired original URLs after a five minute retention window', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'media-resolver-expired-minutes-'))
-  const image = join(root, 'resolved-image-stale.jpg')
-  const manifest = join(root, 'resolved-image-stale.jpg.json')
-  await writeFile(image, 'image')
-  await writeFile(manifest, JSON.stringify({
-    filename: 'resolved-image-stale.jpg',
-    url: '/chatluna-image-resolver/resolved-image-stale.jpg',
-    originalUrl: 'https://cdn.example.test/stale.jpg',
-    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
-  }, null, 2))
-
-  await markManagedCacheEntryExpired(root, 'resolved-image-stale.jpg.json', {
-    ok: false,
-    status: 404
-  }, Date.parse('2026-05-10T00:00:00.000Z'))
-
-  const early = await cleanupManagedImageCache(root, {
-    retentionDays: 30,
-    expiredRetentionMinutes: 5,
-    now: Date.parse('2026-05-10T00:04:59.000Z')
-  })
-  assert.equal(early.deleted, 0)
-
-  const late = await cleanupManagedImageCache(root, {
-    retentionDays: 30,
-    expiredRetentionMinutes: 5,
-    now: Date.parse('2026-05-10T00:05:00.000Z')
-  })
-  assert.equal(late.deleted, 2)
-  await assert.rejects(() => stat(image))
-  await assert.rejects(() => stat(manifest))
-})
-
-test('sweeps original URLs in bounded batches and marks dead cache entries', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'media-resolver-sweep-'))
-  await writeFile(join(root, 'resolved-image-a.jpg'), 'image')
-  await writeFile(join(root, 'resolved-image-a.jpg.json'), JSON.stringify({
-    filename: 'resolved-image-a.jpg',
-    url: '/chatluna-image-resolver/resolved-image-a.jpg',
-    originalUrl: 'https://cdn.example.test/a.jpg',
-    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
-  }, null, 2))
-  await writeFile(join(root, 'resolved-image-b.jpg'), 'image')
-  await writeFile(join(root, 'resolved-image-b.jpg.json'), JSON.stringify({
-    filename: 'resolved-image-b.jpg',
-    url: '/chatluna-image-resolver/resolved-image-b.jpg',
-    originalUrl: 'https://cdn.example.test/b.jpg',
-    createdAt: new Date('2026-05-10T00:00:00.000Z').toISOString()
-  }, null, 2))
-
-  const oldFetch = global.fetch
-  const calls = []
-  global.fetch = async (url) => {
-    calls.push(String(url))
-    return {
-      ok: false,
-      status: 404,
-      headers: new Map(),
-      arrayBuffer: async () => new ArrayBuffer(0),
-      json: async () => ({})
-    }
-  }
-  try {
-    const summary = await sweepManagedCacheOriginalUrls(root, {
-      search: { pageTimeoutMs: 1000 },
-      image: { userAgent: 'test' },
-      storage: { livenessCheckBatchSize: 1, cleanupIntervalMinutes: 5 }
-    }, {
-      maxChecks: 1,
-      minCheckIntervalMinutes: 5,
-      now: Date.parse('2026-05-10T00:10:00.000Z')
-    })
-
-    assert.equal(summary.checked, 1)
-    assert.equal(summary.expired, 1)
-    assert.equal(calls.length, 2)
-    const first = JSON.parse(await readFile(join(root, 'resolved-image-a.jpg.json'), 'utf8'))
-    const second = JSON.parse(await readFile(join(root, 'resolved-image-b.jpg.json'), 'utf8'))
-    assert.equal(first.originalUrlExpired, true)
-    assert.equal(second.originalUrlExpired, undefined)
-  } finally {
-    global.fetch = oldFetch
-  }
 })
 
 test('writes a visible manifest when storing to local directory', async () => {
@@ -423,17 +240,135 @@ test('writes a visible manifest when storing to local directory', async () => {
     }
   }
 
-  const url = await storeManagedAsset(ctx, config, Buffer.from('voice'), 'resolved-audio-voice.silk', 'audio/silk', {
+  const stored = await storeManagedAsset(ctx, config, Buffer.from('voice'), 'resolved-audio-voice.silk', 'audio/silk', {
     kind: 'audio',
     originalUrl: 'https://multimedia.nt.qq.com.cn/download?fileid=voice'
   })
 
-  assert.equal(url, 'https://bot.example.test/chatluna-image-resolver/resolved-audio-voice.silk')
+  assert.equal(stored.cachedUrl, 'https://bot.example.test/chatluna-image-resolver/resolved-audio-voice.silk')
+  assert.equal(stored.imageBedUrl, undefined)
+  assert.equal(stored.storage, 'local')
   const manifest = JSON.parse(await readFile(join(root, 'cache', 'resolved-audio-voice.silk.json'), 'utf8'))
   assert.equal(manifest.kind, 'audio')
   assert.equal(manifest.storage, 'local')
-  assert.equal(manifest.url, url)
+  assert.equal(manifest.url, stored.cachedUrl)
   assert.equal(manifest.bytes, 5)
   const fileContent = await readFile(join(root, 'cache', 'resolved-audio-voice.silk'), 'utf8')
   assert.equal(fileContent, 'voice')
+})
+
+// --- Manifest enrichment: pure utility functions ---
+
+test('computeOrientation returns landscape, portrait, or square', () => {
+  assert.equal(computeOrientation(1920, 1080), 'landscape')
+  assert.equal(computeOrientation(1080, 1920), 'portrait')
+  assert.equal(computeOrientation(500, 500), 'square')
+  assert.equal(computeOrientation(undefined, 1080), undefined)
+  assert.equal(computeOrientation(1920, undefined), undefined)
+  assert.equal(computeOrientation(0, 0), undefined)
+})
+
+test('computeAspectRatio returns width/height rounded to 2 decimals', () => {
+  assert.equal(computeAspectRatio(1920, 1080), 1.78)
+  assert.equal(computeAspectRatio(1080, 1920), 0.56)
+  assert.equal(computeAspectRatio(500, 500), 1)
+  assert.equal(computeAspectRatio(undefined, 100), undefined)
+  assert.equal(computeAspectRatio(100, 0), undefined)
+})
+
+test('detectIsAnimated identifies animated image formats', () => {
+  assert.equal(detectIsAnimated('image/gif', 'test.gif'), true)
+  assert.equal(detectIsAnimated('image/apng', 'test.apng'), true)
+  assert.equal(detectIsAnimated('image/png', 'test.png'), false)
+  assert.equal(detectIsAnimated('image/webp', 'test.webp'), false)
+  assert.equal(detectIsAnimated('image/jpeg', 'test.jpg'), false)
+})
+
+test('generateBatchId is deterministic for same query and stable across calls', () => {
+  const id1 = generateBatchId('碧蓝档案天童柯伊立绘', 1716000000000)
+  const id2 = generateBatchId('碧蓝档案天童柯伊立绘', 1716000000000)
+  assert.equal(id1, id2)
+  assert.ok(id1.startsWith('batch-'))
+  assert.ok(id1.length > 10)
+
+  const id3 = generateBatchId('不同的查询', 1716000000000)
+  assert.notEqual(id1, id3)
+})
+
+test('extractPageTitle extracts title from SerpAPI image result item', () => {
+  assert.equal(
+    extractPageTitle({ title: '天童柯伊 - 萌娘百科 万物皆可萌的百科全书', link: 'https://moegirl.org' }),
+    '天童柯伊 - 萌娘百科 万物皆可萌的百科全书'
+  )
+  assert.equal(extractPageTitle({ link: 'https://moegirl.org' }), undefined)
+  assert.equal(extractPageTitle({}), undefined)
+  assert.equal(extractPageTitle(null), undefined)
+})
+
+test('manifest stores enriched metadata when provided via storeManagedAsset', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'manifest-enriched-'))
+  const ctx = {
+    baseDir: root,
+    server: { selfUrl: 'http://127.0.0.1:5140' },
+    logger() { return { warn() {} } }
+  }
+  const config = {
+    image: { tempExpireHours: 168 },
+    storage: { localDirectory: 'cache', localPublicPath: '/chatluna-image-resolver', retentionDays: 7 },
+    delivery: { publicBaseUrl: '' },
+    search: { pageTimeoutMs: 10000 }
+  }
+
+  const url = await storeManagedAsset(ctx, config, Buffer.from('img'), 'resolved-enriched-test.png', 'image/png', {
+    kind: 'keyword-search',
+    originalUrl: 'https://storage.moegirl.org.cn/BA_Kei_ML.png',
+    sourcePage: 'https://zh.moegirl.org.cn/天童柯伊',
+    searchQuery: '碧蓝档案天童柯伊立绘',
+    batchId: 'batch-abc123',
+    pageTitle: '天童柯伊 - 萌娘百科',
+    tags: ['天童柯伊', '碧蓝档案'],
+    width: 1200,
+    height: 885,
+    orientation: 'landscape',
+    aspectRatio: 1.36,
+    isAnimated: false
+  })
+
+  assert.ok(url)
+  const manifest = JSON.parse(await readFile(join(root, 'cache', 'resolved-enriched-test.png.json'), 'utf8'))
+  assert.equal(manifest.searchQuery, '碧蓝档案天童柯伊立绘')
+  assert.equal(manifest.batchId, 'batch-abc123')
+  assert.equal(manifest.pageTitle, '天童柯伊 - 萌娘百科')
+  assert.deepEqual(manifest.tags, ['天童柯伊', '碧蓝档案'])
+  assert.equal(manifest.width, 1200)
+  assert.equal(manifest.height, 885)
+  assert.equal(manifest.orientation, 'landscape')
+  assert.equal(manifest.aspectRatio, 1.36)
+  assert.equal(manifest.isAnimated, false)
+})
+
+test('serpApiImagesToCandidates preserves title from search results', () => {
+  const candidates = serpApiImagesToCandidates({
+    images_results: [
+      {
+        title: '天童柯伊 - 萌娘百科 万物皆可萌的百科全书',
+        link: 'https://zh.moegirl.org.cn/天童柯伊',
+        original: 'https://storage.moegirl.org.cn/BA_Kei_ML.png',
+        original_width: 1200,
+        original_height: 885
+      }
+    ]
+  })
+  assert.equal(candidates.length, 1)
+  assert.equal(candidates[0].url, 'https://storage.moegirl.org.cn/BA_Kei_ML.png')
+  assert.equal(candidates[0].title, '天童柯伊 - 萌娘百科 万物皆可萌的百科全书')
+  assert.equal(candidates[0].width, 1200)
+})
+
+test('extractTagsFromQuery splits Chinese and mixed queries into tags', () => {
+  assert.deepEqual(extractTagsFromQuery('碧蓝档案 天童柯伊 立绘'), ['碧蓝档案', '天童柯伊', '立绘'])
+  assert.deepEqual(extractTagsFromQuery('Tendou Aris fanart'), ['Tendou', 'Aris', 'fanart'])
+  assert.deepEqual(extractTagsFromQuery('碧蓝档案天童柯伊立绘'), ['碧蓝档案天童柯伊立绘'])
+  assert.deepEqual(extractTagsFromQuery(''), [])
+  assert.deepEqual(extractTagsFromQuery('  blue archive   Kei  '), ['blue', 'archive', 'Kei'])
 })

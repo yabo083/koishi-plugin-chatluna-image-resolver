@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-miyako-chatluna-media-resolver",
-  "version": "1.4.0",
-  "description": "Miyako ChatLuna media and file resolver with keyword image search, reverse image search, unified QQ media links, managed local cache, and optional WebDAV sync.",
+  "version": "1.5.0",
+  "description": "Miyako ChatLuna media resolver with SerpApi image search, Google Lens reverse search, QQ media links, public URL delivery, and SQLite-indexed cache.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yabo083/koishi-plugin-chatluna-image-resolver.git"
@@ -16,6 +16,7 @@
     "lib",
     "dist",
     "client",
+    "docs/skills",
     "README.md",
     "LICENSE"
   ],
@@ -58,10 +59,12 @@
   },
   "dependencies": {
     "@langchain/core": "^0.3.0",
+    "archiver": "^8.0.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@koishijs/client": "^5.30.11",
+    "@types/archiver": "^7.0.0",
     "@types/node": "^22.7.5",
     "typescript": "^5.6.2"
   },
@@ -73,13 +76,14 @@
       "dist"
     ],
     "description": {
-      "zh": "Miyako ChatLuna 媒体/文件解析器：搜图、以图搜图、统一 QQ 媒体直链、缓存管理与 WebDAV 同步。"
+      "zh": "Miyako ChatLuna 媒体/文件解析器：SerpApi 搜图与反搜、QQ 媒体直链、公网 URL 分发、SQLite 缓存索引。"
     },
     "service": {
       "optional": [
         "chatluna",
-        "chatluna_storage",
-        "console"
+        "server",
+        "console",
+        "database"
       ]
     }
   }

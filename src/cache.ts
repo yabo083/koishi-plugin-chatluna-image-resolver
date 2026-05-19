@@ -2,10 +2,14 @@ import type { Context } from 'koishi'
 import { createHash } from 'node:crypto'
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { Config, TrackedMediaKind, WebDavConfig } from './types'
+import type { Config, ManagedAssetMetadata, TrackedMediaKind } from './types'
+import { manifestToAssetInput } from './cache-migration'
+import { upsertAsset, purgeAssetsByFilename, listColdAssets } from './cache-store'
+import { uploadToImageBed, deleteFromImageBed } from './imagebed'
+import { isKindCacheable } from './cache-settings'
+import { computeAspectRatio, computeOrientation, detectIsAnimated } from './utils'
 import {
   acceptHeaderForKind,
-  basicAuth,
   defaultExtForKind,
   detectManagedAssetKind,
   extFromUrl,
@@ -19,16 +23,18 @@ import {
 
 const loggerName = 'miyako-chatluna-media-resolver'
 
-export async function cleanupManagedImageCache(directory: string, options: { retentionDays: number; expiredRetentionDays?: number; expiredRetentionMinutes?: number; now?: number }) {
+export async function cleanupManagedImageCache(ctx: Context | undefined, directory: string, options: { retentionDays: number; now?: number; config?: Config }) {
   const now = options.now ?? Date.now()
-  const cutoff = now - Math.max(1, options.retentionDays) * 24 * 60 * 60 * 1000
-  const expiredRetentionMs = Number.isFinite(Number(options.expiredRetentionMinutes))
-    ? Math.max(1, Number(options.expiredRetentionMinutes)) * 60 * 1000
-    : Math.max(1 / 1440, options.expiredRetentionDays ?? options.retentionDays) * 24 * 60 * 60 * 1000
-  const expiredCutoff = now - expiredRetentionMs
+  const isImageBed = options.config?.publicAccess?.mode === 'image-bed'
+  // In image-bed mode local file is just a transient buffer; honor imageBedLocalBufferHours.
+  // In self-hosted mode the local file IS the durable cache; honor retentionDays.
+  const cutoff = isImageBed
+    ? now - Math.max(0, options.config?.storage.imageBedLocalBufferHours ?? 1) * 60 * 60 * 1000
+    : now - Math.max(1, options.retentionDays) * 24 * 60 * 60 * 1000
   let deleted = 0
   let scanned = 0
   let skipped = 0
+  const deletedFilenames: string[] = []
   let entries: string[] = []
   try {
     entries = await readdir(directory)
@@ -43,71 +49,98 @@ export async function cleanupManagedImageCache(directory: string, options: { ret
     scanned++
     const file = join(directory, entry)
     try {
-      if (entry.endsWith('.json')) {
-        const manifest = await readManifest(file)
-        const expiredAt = manifest?.originalUrlExpiredAt ? Date.parse(manifest.originalUrlExpiredAt) : 0
-        if (manifest?.originalUrlExpired && expiredAt && expiredAt <= expiredCutoff) {
-          const asset = typeof manifest.filename === 'string' ? join(directory, manifest.filename) : ''
-          if (asset) deleted += await deleteIfExists(asset)
-          deleted += await deleteIfExists(file)
-          continue
-        }
-      }
       const info = await stat(file)
       if (!info.isFile() || info.mtimeMs > cutoff) continue
       await unlink(file)
       deleted++
+      if (!entry.endsWith('.json')) deletedFilenames.push(entry)
     } catch {
       skipped++
     }
   }
+  // Self-hosted: local file IS the cache, so unlinking means the asset is gone — purge DB.
+  // Image-bed: local file was just a hot buffer; R2 + DB rows survive. Only the
+  // separate "cold purge" job (Phase 2) and explicit UI delete should remove R2/DB.
+  if (ctx && deletedFilenames.length && !isImageBed) {
+    try { await purgeAssetsByFilename(ctx, deletedFilenames) } catch {}
+  }
   return { scanned, deleted, skipped }
 }
 
-export async function markManagedCacheEntryExpired(directory: string, manifestName: string, check: Record<string, unknown>, now = Date.now()) {
-  if (!isManagedCacheFilename(manifestName) || !manifestName.endsWith('.json')) {
-    throw new Error('invalid managed manifest name')
+/**
+ * Phase 2 cold purge. Scans DB for assets that have not been accessed for
+ * `coldThresholdDays` and removes them everywhere (R2 + DB + any lingering
+ * local files + manifest). Returns a summary suitable for log/UI display.
+ *
+ * Safe to call on a periodic timer regardless of publicAccess mode — for
+ * self-hosted mode the local cleanup tick already handles aging by mtime,
+ * but a quiet asset can still accumulate DB clutter, so this catches both.
+ */
+export async function runColdPurge(ctx: Context, config: Config, now = new Date()) {
+  const thresholdDays = Math.max(0, Number(config.storage.coldThresholdDays ?? 0))
+  if (!thresholdDays || !(ctx as any).database) return { eligible: 0, purgedDb: 0, purgedImageBed: 0, purgedLocal: 0 }
+
+  const cold = await listColdAssets(ctx, thresholdDays, now)
+  if (!cold.length) return { eligible: 0, purgedDb: 0, purgedImageBed: 0, purgedLocal: 0 }
+
+  const directory = join(ctx.baseDir, config.storage.localDirectory)
+  const filenames = cold.map((row) => row.filename).filter(Boolean) as string[]
+
+  // 1. Unlink any remaining local files / manifests (best-effort).
+  let purgedLocal = 0
+  for (const filename of filenames) {
+    try { await unlink(join(directory, filename)); purgedLocal++ } catch {}
+    try { await unlink(join(directory, `${filename}.json`)) } catch {}
   }
+
+  // 2. Delete from image bed if applicable.
+  let purgedImageBed = 0
+  if (config.publicAccess?.mode === 'image-bed' && filenames.length) {
+    const timeoutMs = config.search?.pageTimeoutMs ?? 30000
+    const results = await Promise.all(filenames.map((fn) =>
+      deleteFromImageBed(fn, config.publicAccess as any, timeoutMs).catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+    ))
+    purgedImageBed = results.filter((r) => r.ok).length
+  }
+
+  // 3. Purge DB rows.
+  const purgedDb = await purgeAssetsByFilename(ctx, filenames)
+
+  invalidateManifestIndex(directory)
+  return { eligible: cold.length, purgedDb, purgedImageBed, purgedLocal }
+}
+
+export async function updateManagedCacheEntry(directory: string, manifestName: string, fields: Record<string, unknown>) {
+  if (!isManagedCacheFilename(manifestName) || !manifestName.endsWith('.json')) return undefined
   const file = join(directory, manifestName)
   const manifest = await readManifest(file)
-  if (!manifest) throw new Error('managed manifest not found or invalid')
-  const expired = check?.ok === false
-  const next = {
-    ...manifest,
-    originalUrlExpired: expired || manifest.originalUrlExpired === true,
-    originalUrlExpiredAt: expired
-      ? new Date(now).toISOString()
-      : manifest.originalUrlExpiredAt,
-    originalUrlLastCheck: {
-      ...check,
-      checkedAt: new Date(now).toISOString()
-    }
-  }
+  if (!manifest) return undefined
+  const next = { ...manifest, ...fields }
   await writeFile(file, JSON.stringify(next, null, 2))
+  invalidateManifestIndex(directory)
   return next
 }
 
-export async function markManagedCacheEntryChecked(directory: string, manifestName: string, check: Record<string, unknown>, now = Date.now()) {
-  if (!isManagedCacheFilename(manifestName) || !manifestName.endsWith('.json')) {
-    throw new Error('invalid managed manifest name')
+const manifestIndexes = new Map<string, { byUrl: Map<string, any>; byOriginalUrl: Map<string, any>; items: any[]; builtAt: number }>()
+
+async function getManifestIndex(directory: string, maxAgeMs = 10_000) {
+  const cached = manifestIndexes.get(directory)
+  if (cached && Date.now() - cached.builtAt < maxAgeMs) return cached
+
+  const { items } = await listManagedImageCache(directory)
+  const byUrl = new Map<string, any>()
+  const byOriginalUrl = new Map<string, any>()
+  for (const item of items) {
+    if (item.url) byUrl.set(item.url, item)
+    if (item.originalUrl) byOriginalUrl.set(item.originalUrl, item)
   }
-  const file = join(directory, manifestName)
-  const manifest = await readManifest(file)
-  if (!manifest) throw new Error('managed manifest not found or invalid')
-  const expired = check?.ok === false
-  const next = {
-    ...manifest,
-    originalUrlExpired: expired ? true : false,
-    originalUrlExpiredAt: expired
-      ? manifest.originalUrlExpiredAt || new Date(now).toISOString()
-      : undefined,
-    originalUrlLastCheck: {
-      ...check,
-      checkedAt: new Date(now).toISOString()
-    }
-  }
-  await writeFile(file, JSON.stringify(next, null, 2))
-  return next
+  const index = { byUrl, byOriginalUrl, items, builtAt: Date.now() }
+  manifestIndexes.set(directory, index)
+  return index
+}
+
+export function invalidateManifestIndex(directory: string) {
+  manifestIndexes.delete(directory)
 }
 
 export async function listManagedImageCache(directory: string) {
@@ -138,14 +171,14 @@ export async function listManagedImageCache(directory: string) {
 
 export async function findManagedCacheByOriginalUrl(directory: string, originalUrl: string) {
   if (!originalUrl) return undefined
-  const { items } = await listManagedImageCache(directory)
-  return items.find((item) => item.originalUrl === originalUrl && item.url && !item.originalUrlExpired)
+  const index = await getManifestIndex(directory)
+  return index.byOriginalUrl.get(originalUrl)
 }
 
 export async function findManagedCacheByCachedUrl(directory: string, cachedUrl: string) {
   if (!cachedUrl) return undefined
-  const { items } = await listManagedImageCache(directory)
-  return items.find((item) => item.url === cachedUrl && !item.originalUrlExpired)
+  const index = await getManifestIndex(directory)
+  return index.byUrl.get(cachedUrl)
 }
 
 export async function searchManagedCache(directory: string, query: string, limit = 10) {
@@ -154,7 +187,6 @@ export async function searchManagedCache(directory: string, query: string, limit
   const q = query.toLowerCase()
   return items
     .filter((item) => {
-      if (item.originalUrlExpired) return false
       const url = String(item.url || '').toLowerCase()
       const orig = String(item.originalUrl || '').toLowerCase()
       const source = String(item.sourcePage || '').toLowerCase()
@@ -162,72 +194,6 @@ export async function searchManagedCache(directory: string, query: string, limit
       return url.includes(q) || orig.includes(q) || source.includes(q) || file.includes(q)
     })
     .slice(0, Math.max(1, limit))
-}
-
-export async function sweepManagedCacheOriginalUrls(
-  directory: string,
-  config: Config,
-  options: { maxChecks?: number; minCheckIntervalMinutes?: number; now?: number; onRevive?: (item: any, downloaded: { buffer: Buffer; mime: string; filename: string }) => Promise<void> } = {}
-) {
-  const now = options.now ?? Date.now()
-  const maxChecks = Math.max(1, Math.floor(options.maxChecks ?? config.storage.livenessCheckBatchSize ?? 12))
-  const minCheckIntervalMs = Math.max(1, options.minCheckIntervalMinutes ?? config.storage.cleanupIntervalMinutes ?? 5) * 60 * 1000
-  const { items } = await listManagedImageCache(directory)
-  const candidates = items
-    .filter((item) => item.manifest && item.originalUrl && !item.originalUrlExpired)
-    .filter((item) => {
-      const checkedAt = item.originalUrlLastCheck?.checkedAt ? Date.parse(item.originalUrlLastCheck.checkedAt) : 0
-      return !checkedAt || checkedAt <= now - minCheckIntervalMs
-    })
-    .sort((a, b) => {
-      const aTime = a.originalUrlLastCheck?.checkedAt ? Date.parse(a.originalUrlLastCheck.checkedAt) : 0
-      const bTime = b.originalUrlLastCheck?.checkedAt ? Date.parse(b.originalUrlLastCheck.checkedAt) : 0
-      return aTime - bTime
-    })
-    .slice(0, maxChecks)
-
-  let checked = 0
-  let expired = 0
-  let refreshed = 0
-  let revived = 0
-  for (const item of candidates) {
-    const result = await checkRemoteImageAlive(String(item.originalUrl), config)
-    checked++
-    if (result.ok === false) {
-      await markManagedCacheEntryExpired(directory, item.manifest, result, now)
-      expired++
-    } else {
-      await markManagedCacheEntryChecked(directory, item.manifest, result, now)
-      refreshed++
-      if (config.storage.autoRevive && item.filename) {
-        const assetMissing = await isAssetMissing(directory, item)
-        if (assetMissing) {
-          try {
-            const kind = detectManagedAssetKind(item.filename, item.mime || '')
-            const downloaded = await downloadMediaFromUrl(String(item.originalUrl), config, { kind })
-            if (options.onRevive) {
-              await options.onRevive(item, downloaded)
-            } else {
-              await mkdir(directory, { recursive: true })
-              await writeFile(join(directory, item.filename), downloaded.buffer)
-            }
-            revived++
-          } catch {}
-        }
-      }
-    }
-  }
-  return { checked, expired, refreshed, revived, remaining: Math.max(0, items.length - candidates.length) }
-}
-
-async function isAssetMissing(directory: string, item: any): Promise<boolean> {
-  if (!item.filename) return false
-  try {
-    await stat(join(directory, item.filename))
-    return false
-  } catch {
-    return true
-  }
 }
 
 export async function checkRemoteImageAlive(url: string, config: Pick<Config, 'search' | 'image'>) {
@@ -279,30 +245,101 @@ async function readManifest(file: string) {
   }
 }
 
-async function deleteIfExists(file: string) {
-  try {
-    await unlink(file)
-    return 1
-  } catch {
-    return 0
-  }
-}
-
-export async function storeManagedImage(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: Record<string, unknown> = {}) {
+export async function storeManagedImage(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: ManagedAssetMetadata = {}) {
   return storeManagedAsset(ctx, config, buffer, filename, mime, metadata)
 }
 
-export async function storeManagedAsset(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: Record<string, unknown> = {}) {
+export async function storeManagedAsset(ctx: Context, config: Config, buffer: Buffer, filename: string, mime: string, metadata: ManagedAssetMetadata = {}) {
+  // Per-kind cache toggle (managed from the panel). When disabled for this
+  // kind, skip everything: no local file, no manifest, no DB row, no image-bed
+  // upload. The tool caller falls back to the originalUrl.
+  if (!isKindCacheable(metadata.kind)) {
+    return { cachedUrl: undefined, imageBedUrl: undefined, storage: 'local' as const, skipped: true as const }
+  }
   const dir = join(ctx.baseDir, config.storage.localDirectory)
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, filename), buffer)
   const base = trimTrailingSlash(ctx.server?.selfUrl ?? '')
-  const publicUrl = rewriteUrlBase(`${base}${config.storage.localPublicPath}/${filename}`, config.delivery.publicBaseUrl)
-  await writeManagedAssetManifest(ctx, config, filename, publicUrl, mime, buffer.length, {
-    storage: 'local',
+  const effectivePublicBase = (config.publicAccess?.mode === 'self-hosted' && config.publicAccess?.publicBaseUrl)
+    ? config.publicAccess.publicBaseUrl
+    : config.delivery.publicBaseUrl
+  const localUrl = rewriteUrlBase(`${base}${config.storage.localPublicPath}/${filename}`, effectivePublicBase)
+
+  // Image-bed mode: upload to S3/WebDAV and store the public URL as imageBedUrl
+  // alongside the always-set local URL. Tools then decide per call (via
+  // resolveLiveCachedUrl) which URL to expose as cachedUrl: NapCat-bound callers
+  // prefer the local hot-buffer URL for speed; external-facing consumers prefer
+  // the durable image-bed URL. The local file expires after imageBedLocalBufferHours.
+  let imageBedUrl = ''
+  let imageBedProvider = ''
+  let storage: 'local' | 'image-bed' = 'local'
+  if (config.publicAccess?.mode === 'image-bed') {
+    try {
+      const upload = await uploadToImageBed(buffer, filename, mime, config.publicAccess as any, config.search?.pageTimeoutMs ?? 30000)
+      if (upload.ok && upload.publicUrl) {
+        imageBedUrl = upload.publicUrl
+        imageBedProvider = upload.provider || config.publicAccess.imageBedProvider || ''
+        storage = 'image-bed'
+        // If local buffer disabled (=0), unlink immediately to avoid disk bloat.
+        if ((config.storage?.imageBedLocalBufferHours ?? 1) <= 0) {
+          try { await unlink(join(dir, filename)) } catch {}
+        }
+      } else {
+        ctx.logger('miyako-chatluna-media-resolver').warn('image bed upload failed, falling back to local URL: %s', upload.error || 'unknown error')
+      }
+    } catch (error) {
+      ctx.logger('miyako-chatluna-media-resolver').warn('image bed upload threw, falling back to local URL: %s', error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  // Auto-compute physical metadata from buffer if not already provided
+  const w = metadata.width
+  const h = metadata.height
+  const autoFields: ManagedAssetMetadata = {}
+  if (w && h && !metadata.orientation) autoFields.orientation = computeOrientation(w, h)
+  if (w && h && !metadata.aspectRatio) autoFields.aspectRatio = computeAspectRatio(w, h)
+  if (metadata.isAnimated === undefined && mime.startsWith('image/')) autoFields.isAnimated = detectIsAnimated(mime, filename)
+
+  // manifest.url is always the local URL pattern; imageBedUrl carried separately.
+  const manifest = await writeManagedAssetManifest(ctx, config, filename, localUrl, mime, buffer.length, {
+    storage,
+    ...(imageBedUrl ? { imageBedUrl, imageBedProvider } : {}),
+    ...autoFields,
     ...metadata
   })
-  return publicUrl
+  if ((ctx as any).database) {
+    const converted = manifestToAssetInput({
+      ...manifest,
+      sha1: createHash('sha1').update(buffer).digest('hex')
+    })
+    await upsertAsset(ctx, converted.asset, converted.aliases, converted.tags)
+  }
+  invalidateManifestIndex(dir)
+  return { cachedUrl: localUrl, imageBedUrl: imageBedUrl || undefined, storage }
+}
+
+/**
+ * Pick the right URL to expose as `cachedUrl` in a tool response.
+ *
+ * In image-bed mode the local file is a short-lived hot buffer; once it's been
+ * unlinked by the cleanup tick we must hand back the image-bed URL instead,
+ * otherwise consumers like NapCat would get a 404.
+ *
+ * Pass either a partial asset row (from cache-store) or a raw manifest object.
+ */
+export async function resolveLiveCachedUrl(
+  directory: string,
+  asset: { filename?: string; url?: string; imageBedUrl?: string },
+  _config?: Config
+): Promise<string | undefined> {
+  if (!asset?.url) return asset?.imageBedUrl
+  if (!asset.filename) return asset.url
+  try {
+    await stat(join(directory, asset.filename))
+    return asset.url
+  } catch {
+    return asset.imageBedUrl || asset.url
+  }
 }
 
 export async function downloadImageFromUrl(url: string, config: Config, options: { referer?: string } = {}) {
@@ -356,28 +393,20 @@ export async function readJsonBody(koa: any) {
   }
 }
 
-export async function ensureWebDavCollections(cfg: WebDavConfig, basePath: string, timeoutMs: number) {
-  if (!basePath) return
-  let current = trimTrailingSlash(cfg.endpoint)
-  for (const segment of basePath.split('/').filter(Boolean)) {
-    current = `${current}/${encodeURIComponent(segment)}`
-    await fetchWithTimeout(current, {
-      method: 'MKCOL',
-      headers: { 'Authorization': basicAuth(cfg.username, cfg.password) }
-    }, timeoutMs).catch(() => undefined)
-  }
-}
-
-export async function writeManagedAssetManifest(ctx: Context, config: Config, filename: string, publicUrl: string, mime: string, bytes: number, metadata: Record<string, unknown>) {
+export async function writeManagedAssetManifest(ctx: Context, config: Config, filename: string, publicUrl: string, mime: string, bytes: number, metadata: ManagedAssetMetadata) {
   const dir = join(ctx.baseDir, config.storage.localDirectory)
   await mkdir(dir, { recursive: true })
-  await writeFile(join(dir, `${filename}.json`), JSON.stringify({
+  const manifest = {
+    ...metadata,
     filename,
     url: publicUrl,
     mime,
     bytes,
     createdAt: new Date().toISOString(),
     retentionDays: config.storage.retentionDays,
-    ...metadata
-  }, null, 2))
+    storage: metadata.storage || 'local',
+    kind: metadata.kind || detectManagedAssetKind(filename, mime)
+  }
+  await writeFile(join(dir, `${filename}.json`), JSON.stringify(manifest, null, 2))
+  return manifest
 }

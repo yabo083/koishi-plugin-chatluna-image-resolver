@@ -1,289 +1,34 @@
 import { Context } from 'koishi'
-import { createHash, createSign } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
-import type { Config, GoogleReverseResult, ImageCandidate, SerpApiLensResult, SerpApiReverseResult, StoredImage } from './types'
+import type { Config, ImageCandidate, SerpApiLensResult, StoredImage } from './types'
 import type { SessionContext } from './tracker'
-import { downloadMediaFromUrl, ensureWebDavCollections, findManagedCacheByCachedUrl, storeManagedAsset, storeManagedImage } from './cache'
+import { downloadMediaFromUrl, findManagedCacheByCachedUrl, storeManagedAsset, storeManagedImage, updateManagedCacheEntry } from './cache'
+import { uploadToImageBed } from './imagebed'
 import {
   attachReverseNote,
-  basicAuth,
-  buildGoogleVisionWebDetectionRequest,
-  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
-  buildSerpApiReverseImageUrl,
   clamp,
+  computeAspectRatio,
+  computeOrientation,
+  detectIsAnimated,
+  extractPageTitle,
+  extractTagsFromQuery,
   extFromUrl,
   fetchWithTimeout,
   formatError,
+  generateBatchId,
   isPublicHttpUrl,
   mimeToExt,
   normalizeImageUrl,
-  normalizeWebDetection,
   rewriteImageUrlForPublicAccess,
   scoreCandidate,
   serpApiImagesToCandidates,
   serpApiLensPayloadToResult,
-  serpApiReversePayloadToResult,
-  trimSlashes,
   trimTrailingSlash,
   uniqueBy
 } from './utils'
-
-export type ReverseProvider = Config['reverse']['provider']
-export type ResolvedReverseProvider = Exclude<ReverseProvider, 'auto'>
-
-const GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL = 'https://tse1.mm.bing.net/th/id/OIP.wm8JD4yZQvYkDxtZpPR3vAHaFU?r=0&rs=1&pid=ImgDetMain&o=7&rm=3'
-const GOOGLE_VISION_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
-const DEFAULT_GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token'
-
-const googleTokenCache = new Map<string, { token: string; expiresAt: number }>()
-
-export function selectReverseProvider(options: {
-  configuredProvider: ReverseProvider
-  providerOverride?: ReverseProvider
-  imageUrl: string
-  publicImageUrl?: string
-  hasGoogleCredentials?: boolean
-  hasGoogleKey?: boolean
-}): { provider: ResolvedReverseProvider; fallback?: ResolvedReverseProvider; reason: string } {
-  const raw = options.providerOverride ?? options.configuredProvider
-  const requested = ((raw as string) === 'serpapi' ? 'serpapi-lens' : raw) as ResolvedReverseProvider | 'auto'
-  const publicImageUrl = options.publicImageUrl ?? options.imageUrl
-  const publicUrl = isPublicHttpUrl(publicImageUrl)
-  const hasGoogle = options.hasGoogleCredentials || Boolean(options.hasGoogleKey)
-
-  if (requested === 'serpapi-lens') {
-    return {
-      provider: 'serpapi-lens',
-      fallback: hasGoogle ? 'google' : undefined,
-      reason: `SerpApi Lens.${hasGoogle ? ' Fallback: Google Vision.' : ''}`
-    }
-  }
-
-  if (requested === 'google') {
-    return {
-      provider: 'google',
-      fallback: publicUrl ? 'serpapi-lens' : undefined,
-      reason: `Google Vision.${publicUrl ? ' Fallback: SerpApi Lens.' : ''}`
-    }
-  }
-
-  if (!publicUrl && hasGoogle) {
-    return {
-      provider: 'google',
-      fallback: 'serpapi-lens',
-      reason: 'Auto: Google Vision for private/local URL. Fallback: SerpApi Lens.'
-    }
-  }
-
-  return {
-    provider: 'serpapi-lens',
-    fallback: hasGoogle ? 'google' : undefined,
-    reason: `Auto: SerpApi Lens.${hasGoogle ? ' Fallback: Google Vision.' : ''}`
-  }
-}
-
-export async function diagnoseGoogleVision(config: Config) {
-  const hasCredentials = hasGoogleVisionCredentials(config)
-  if (!hasCredentials) {
-    return {
-      ok: false,
-      stage: 'config',
-      reason: 'missing-google-service-account',
-      hint: '请在“API 凭据”里填写 Google 服务账号 client_email 与 private_key，并确保该项目已启用 Cloud Vision API。'
-    }
-  }
-
-  try {
-    const diagnosticImage = await downloadGoogleVisionDiagnosticImage(config)
-    const local = await callGoogleVisionDiagnostic(config, {
-      id: 'local-base64',
-      label: '样例图下载后 base64',
-      imageUrl: GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL,
-      body: buildGoogleVisionWebDetectionRequest(diagnosticImage, 5)
-    })
-    if (!local.ok) return local
-
-    const remote = await callGoogleVisionDiagnostic(config, {
-      id: 'public-image-url',
-      label: '公网 imageUri',
-      imageUrl: GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL,
-      body: buildGoogleVisionWebDetectionUriRequest(GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL, 5)
-    })
-    if (!remote.ok) return {
-      ...remote,
-      hint: '服务账号可用于 base64 图片，但公网 imageUri 测试失败。真实本地/缓存图仍可走 Google Vision；如果你要让 Google 直接抓公网图片，再检查该 URL 是否可被 Google 后端访问。'
-    }
-
-    return {
-      ok: true,
-      stage: 'vision-api',
-      status: remote.status,
-      reason: 'reachable',
-      tests: [local, remote],
-      hint: 'Google Vision 服务账号、base64 图片提交、公网 imageUri 提交均可用。'
-    }
-  } catch (error) {
-    return {
-      ok: false,
-      stage: 'network',
-      reason: 'network-or-proxy',
-      error: formatError(error),
-      hint: '请求没有成功到达 Google OAuth 或 Google Vision，优先检查宿主机网络、代理和 ChatLuna 代理配置。'
-    }
-  }
-}
-
-async function downloadGoogleVisionDiagnosticImage(config: Config) {
-  const response = await fetchWithTimeout(GOOGLE_VISION_DIAGNOSTIC_IMAGE_URL, {
-    headers: {
-      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-      'User-Agent': config.image.userAgent
-    }
-  }, config.search.pageTimeoutMs)
-  if (!response.ok) throw new Error(`fetch diagnostic image failed: HTTP ${response.status}`)
-  const mime = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
-  if (mime && !mime.startsWith('image/')) throw new Error(`fetch diagnostic image failed: not image (${mime})`)
-  const buffer = Buffer.from(await response.arrayBuffer())
-  if (!buffer.length) throw new Error('fetch diagnostic image failed: empty body')
-  if (buffer.length > config.image.maxDownloadBytes) throw new Error(`diagnostic image too large: ${buffer.length}`)
-  return buffer
-}
-
-async function callGoogleVisionDiagnostic(config: Config, options: {
-  id: string
-  label: string
-  imageUrl?: string
-  body: unknown
-}) {
-  const auth = await googleVisionAuthHeaders(config)
-  const apiResponse = await fetchWithTimeout(
-    googleVisionAnnotateUrl(config),
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'User-Agent': config.image.userAgent,
-        ...auth
-      },
-      body: JSON.stringify(options.body)
-    },
-    config.search.pageTimeoutMs
-  )
-  const payload: any = await apiResponse.json().catch(() => ({}))
-  const message = payload?.error?.message || payload?.responses?.[0]?.error?.message || ''
-  if (!apiResponse.ok || message) {
-    const status = apiResponse.status
-    return {
-      ok: false,
-      stage: 'vision-api',
-      test: options.id,
-      label: options.label,
-      imageUrl: options.imageUrl,
-      status,
-      reason: status === 400 || status === 401 || status === 403 ? 'service-account-or-api-state' : 'vision-api-error',
-      error: message || `Google Vision HTTP ${status}`,
-      hint: status === 400 || status === 401 || status === 403
-        ? '网络已打到 Google Vision，但服务账号权限、Cloud Vision API 启用状态、结算/配额或项目 IAM 有问题。'
-        : '已连接到 Google Vision，但服务端返回了非成功状态。'
-    }
-  }
-  return {
-    ok: true,
-    stage: 'vision-api',
-    test: options.id,
-    label: options.label,
-    imageUrl: options.imageUrl,
-    status: apiResponse.status,
-    bestGuessLabels: payload?.responses?.[0]?.webDetection?.bestGuessLabels || [],
-    webEntityCount: payload?.responses?.[0]?.webDetection?.webEntities?.length || 0
-  }
-}
-
-function hasGoogleVisionCredentials(config: Config) {
-  return Boolean(config.reverse.googleServiceAccountJson?.trim() || config.reverse.googleApiKey?.trim())
-}
-
-function googleVisionAnnotateUrl(config: Config) {
-  const legacyKey = config.reverse.googleApiKey?.trim()
-  return legacyKey && !config.reverse.googleServiceAccountJson?.trim()
-    ? `https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(legacyKey)}`
-    : 'https://vision.googleapis.com/v1/images:annotate'
-}
-
-async function googleVisionAuthHeaders(config: Config): Promise<Record<string, string>> {
-  if (!config.reverse.googleServiceAccountJson?.trim()) return {}
-  const token = await getGoogleServiceAccountAccessToken(config)
-  return { Authorization: `Bearer ${token}` }
-}
-
-async function getGoogleServiceAccountAccessToken(config: Config) {
-  const credentials = parseGoogleServiceAccount(config.reverse.googleServiceAccountJson)
-  const cacheKey = createHash('sha1')
-    .update(`${credentials.client_email}\n${credentials.private_key}`)
-    .digest('hex')
-  const cached = googleTokenCache.get(cacheKey)
-  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token
-
-  const now = Math.floor(Date.now() / 1000)
-  const tokenUri = credentials.token_uri || DEFAULT_GOOGLE_TOKEN_URI
-  const header = base64UrlJson({ alg: 'RS256', typ: 'JWT' })
-  const claim = base64UrlJson({
-    iss: credentials.client_email,
-    scope: GOOGLE_VISION_SCOPE,
-    aud: tokenUri,
-    exp: now + 3600,
-    iat: now
-  })
-  const unsigned = `${header}.${claim}`
-  const signer = createSign('RSA-SHA256')
-  signer.update(unsigned)
-  signer.end()
-  const signature = signer.sign(credentials.private_key, 'base64url')
-  const assertion = `${unsigned}.${signature}`
-  const response = await fetchWithTimeout(tokenUri, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': config.image.userAgent
-    },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion
-    }).toString()
-  }, config.search.pageTimeoutMs)
-  const payload: any = await response.json().catch(() => ({}))
-  if (!response.ok || !payload?.access_token) {
-    throw new Error(payload?.error_description || payload?.error || `Google OAuth HTTP ${response.status}`)
-  }
-  const expiresIn = Number(payload.expires_in) || 3600
-  googleTokenCache.set(cacheKey, {
-    token: String(payload.access_token),
-    expiresAt: Date.now() + Math.max(60, expiresIn - 60) * 1000
-  })
-  return String(payload.access_token)
-}
-
-function parseGoogleServiceAccount(raw: string) {
-  let parsed: any
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    throw new Error('Google service account JSON is not valid JSON')
-  }
-  const client_email = String(parsed?.client_email || '').trim()
-  const private_key = String(parsed?.private_key || '').replace(/\\n/g, '\n')
-  const token_uri = String(parsed?.token_uri || DEFAULT_GOOGLE_TOKEN_URI).trim()
-  if (!client_email || !private_key) {
-    throw new Error('Google service account JSON must include client_email and private_key')
-  }
-  return { client_email, private_key, token_uri }
-}
-
-function base64UrlJson(value: unknown) {
-  return Buffer.from(JSON.stringify(value)).toString('base64url')
-}
 
 export class ImageResolver {
   constructor(private ctx: Context, private config: Config, private session?: SessionContext) {}
@@ -304,11 +49,13 @@ export class ImageResolver {
       try {
         const downloaded = await this.download(candidate)
         if (!downloaded) continue
-        const stored = await this.store(downloaded.buffer, downloaded.filename, downloaded.mime, candidate)
-        const webdavUrl = await this.syncWebDav(downloaded.buffer, downloaded.filename, downloaded.mime, failures)
+        const stored = await this.store(downloaded.buffer, downloaded.filename, downloaded.mime, candidate, query)
         images.push({
-          url: stored,
-          webdavUrl,
+          // When the kind toggle is off, stored.cachedUrl is undefined — fall
+          // back to the source URL so the search tool still returns something
+          // usable (alive while the upstream link works).
+          url: stored.cachedUrl || candidate.url,
+          imageBedUrl: stored.imageBedUrl,
           originalUrl: candidate.url,
           sourcePage: candidate.sourcePage,
           width: candidate.width,
@@ -358,7 +105,7 @@ export class ImageResolver {
           'Accept': 'application/json',
           'User-Agent': this.config.image.userAgent
         }
-      }, this.config.search.pageTimeoutMs, { noProxy: true })
+      }, this.config.search.pageTimeoutMs)
       const payload: any = await response.json()
       if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`)
       if (payload?.error) throw new Error(String(payload.error))
@@ -389,15 +136,27 @@ export class ImageResolver {
     return { buffer, mime, filename: `resolved-${hash}${ext}` }
   }
 
-  private async store(buffer: Buffer, filename: string, mime: string, candidate?: ImageCandidate) {
+  private async store(buffer: Buffer, filename: string, mime: string, candidate?: ImageCandidate, searchQuery?: string) {
+    const w = candidate?.width
+    const h = candidate?.height
     return storeManagedImage(this.ctx, this.config, buffer, filename, mime, {
       ...(candidate ? {
-        kind: 'keyword-search',
+        kind: 'image' as const,
+        sourceType: 'keyword-search' as const,
         originalUrl: candidate.url,
         sourcePage: candidate.sourcePage,
-        width: candidate.width,
-        height: candidate.height,
+        pageTitle: extractPageTitle(candidate),
+        width: w,
+        height: h,
+        orientation: computeOrientation(w, h),
+        aspectRatio: computeAspectRatio(w, h),
+        isAnimated: detectIsAnimated(mime, filename),
         reason: candidate.reason
+      } : undefined),
+      ...(searchQuery ? {
+        searchQuery,
+        batchId: generateBatchId(searchQuery, Date.now()),
+        tags: extractTagsFromQuery(searchQuery)
       } : undefined),
       ...(this.session ? {
         userId: this.session.userId,
@@ -408,151 +167,115 @@ export class ImageResolver {
     })
   }
 
-  private async syncWebDav(buffer: Buffer, filename: string, mime: string, failures: string[]) {
-    const cfg = this.config.webdav
-    if (!cfg.enabled || !cfg.endpoint.trim()) return undefined
-    try {
-      const basePath = trimSlashes(cfg.basePath)
-      const uploadUrl = `${trimTrailingSlash(cfg.endpoint)}/${basePath ? `${basePath}/` : ''}${encodeURIComponent(filename)}`
-      await ensureWebDavCollections(cfg, basePath, this.config.search.pageTimeoutMs)
-      const response = await fetchWithTimeout(uploadUrl, {
-        method: 'PUT',
-        headers: {
-          'Authorization': basicAuth(cfg.username, cfg.password),
-          'Content-Type': mime,
-          'Content-Length': String(buffer.length)
-        },
-        body: buffer as any
-      }, this.config.search.pageTimeoutMs)
-      if (!response.ok && response.status !== 201 && response.status !== 204) {
-        throw new Error(`WebDAV PUT HTTP ${response.status}`)
-      }
-      if (!cfg.publicBaseUrl.trim()) return undefined
-      return `${trimTrailingSlash(cfg.publicBaseUrl)}/${basePath ? `${basePath}/` : ''}${encodeURIComponent(filename)}`
-    } catch (error) {
-      failures.push(`webdav sync failed: ${formatError(error)}`)
-      return undefined
-    }
-  }
 }
 
 export class ReverseImageResolver {
   constructor(private ctx: Context, private config: Config, private session?: SessionContext) {}
 
-  async resolve(imageUrl: string, providerOverride?: ReverseProvider, maxResultsOverride?: number) {
-    const directory = join(this.ctx.baseDir, this.config.storage.localDirectory)
-    const manifest = await findManagedCacheByCachedUrl(directory, imageUrl).catch(() => undefined)
-    const publicOriginalUrl = manifest?.originalUrl && isPublicHttpUrl(manifest.originalUrl) ? manifest.originalUrl : undefined
-
-    const publicImageUrl = publicOriginalUrl || rewriteImageUrlForPublicAccess(
-      imageUrl,
-      this.ctx.server?.selfUrl || '',
-      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
-    )
-    const selected = selectReverseProvider({
-      configuredProvider: this.config.reverse.provider,
-      providerOverride,
-      imageUrl,
-      publicImageUrl,
-      hasGoogleCredentials: hasGoogleVisionCredentials(this.config)
-    })
-    const explicitOverride = Boolean(providerOverride && providerOverride !== 'auto')
+  async resolve(imageUrl: string, maxResultsOverride?: number) {
     const maxResults = clamp(maxResultsOverride ?? this.config.reverse.maxResults, 1, 50)
 
-    const tryProvider = async (provider: ResolvedReverseProvider) => {
-      if (provider === 'google') return this.callGoogleVision(imageUrl, maxResults)
-      return this.callSerpApiLens(publicImageUrl, maxResults)
+    let resolvedUrl: string
+    let cachedUrl: string | undefined
+    try {
+      const resolved = await this.resolvePublicUrl(imageUrl)
+      resolvedUrl = resolved.publicUrl
+      cachedUrl = resolved.cachedUrl
+    } catch (error) {
+      return {
+        ok: false,
+        provider: 'serpapi-lens',
+        imageUrl,
+        selectedProviderReason: 'SerpApi Google Lens.',
+        error: formatError(error),
+        hint: 'Failed to resolve a public URL. Configure publicAccess: set a public domain (self-hosted) or enable an image bed (S3/WebDAV).'
+      }
     }
 
-    let primaryError: string | undefined
     try {
-      const result = await tryProvider(selected.provider)
-      const cachedInputUrl = await this.cacheReverseInput(imageUrl, selected.provider)
+      const result = await this.callSerpApiLens(resolvedUrl, maxResults)
       return {
         ...attachReverseNote(result, this.config),
-        selectedProviderReason: selected.reason,
-        cachedInputUrl
+        selectedProviderReason: 'SerpApi Google Lens.',
+        cachedInputUrl: cachedUrl
       }
     } catch (error) {
-      primaryError = formatError(error)
-    }
-
-    if (selected.fallback && !explicitOverride) {
-      try {
-        const result = await tryProvider(selected.fallback)
-        const cachedInputUrl = await this.cacheReverseInput(imageUrl, selected.fallback)
-        return {
-          ...attachReverseNote(result, this.config),
-          selectedProviderReason: `${selected.reason} Primary (${selected.provider}) failed: ${primaryError}. Used fallback: ${selected.fallback}.`,
-          cachedInputUrl
-        }
-      } catch (fallbackError) {
-        return {
-          ok: false,
-          provider: selected.provider,
-          imageUrl,
-          selectedProviderReason: selected.reason,
-          error: primaryError,
-          fallbackProvider: selected.fallback,
-          fallbackError: formatError(fallbackError),
-          hint: `Both providers failed. ${selected.provider}: ${primaryError}. ${selected.fallback}: ${formatError(fallbackError)}.`
-        }
+      return {
+        ok: false,
+        provider: 'serpapi-lens',
+        imageUrl,
+        selectedProviderReason: 'SerpApi Google Lens.',
+        error: formatError(error),
+        hint: 'URL-based SerpApi providers require a public image URL. Configure publicAccess to make images accessible.'
       }
-    }
-
-    return {
-      ok: false,
-      provider: selected.provider,
-      imageUrl,
-      selectedProviderReason: selected.reason,
-      error: primaryError,
-      hint: selected.provider === 'google'
-        ? 'Google provider downloads the image and sends base64 bytes to Google Cloud Vision Web Detection.'
-        : 'URL-based SerpApi providers require a public image URL. Use serpapi-lens for QQ/NapCat CDN URLs and reverse.publicBaseUrl to rewrite ChatLuna cached local URLs before calling them.'
     }
   }
 
-  private async callSerpApi(imageUrl: string, maxResults: number): Promise<SerpApiReverseResult> {
-    const apiKey = (this.config.reverse.serpApiKey || this.config.search.serpApiKey).trim()
-    if (!apiKey) throw new Error('missing SerpApi API key')
-    const publicImageUrl = rewriteImageUrlForPublicAccess(
-      imageUrl,
-      this.ctx.server?.selfUrl || '',
-      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
-    )
-    if (!isPublicHttpUrl(publicImageUrl)) {
-      throw new Error('SerpApi reverse image requires a public image URL; the current URL looks private or local')
+  private async resolvePublicUrl(imageUrl: string): Promise<{ publicUrl: string; cachedUrl?: string }> {
+    const directory = join(this.ctx.baseDir, this.config.storage.localDirectory)
+    const manifest = await findManagedCacheByCachedUrl(directory, imageUrl).catch(() => undefined)
+    const publicOriginalUrl = manifest?.originalUrl && isPublicHttpUrl(manifest.originalUrl)
+      ? manifest.originalUrl : undefined
+
+    const mode = this.config.publicAccess?.mode || 'self-hosted'
+
+    // Self-hosted: user's own public domain rewrites the local URL
+    if (mode === 'self-hosted') {
+      const publicUrl = publicOriginalUrl || rewriteImageUrlForPublicAccess(
+        imageUrl,
+        this.ctx.server?.selfUrl || '',
+        this.config.publicAccess?.publicBaseUrl || this.config.delivery.publicBaseUrl
+      )
+      return { publicUrl, cachedUrl: manifest?.url }
     }
-    const response = await fetchWithTimeout(buildSerpApiReverseImageUrl({
-      apiKey,
-      imageUrl: publicImageUrl,
-      googleDomain: this.config.reverse.serpApiGoogleDomain || this.config.search.serpApiGoogleDomain
-    }), {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': this.config.image.userAgent
-      }
-    }, this.config.search.pageTimeoutMs, { noProxy: true })
-    const payload: any = await response.json()
-    if (!response.ok) throw new Error(payload?.error || `SerpApi HTTP ${response.status}`)
-    if (payload?.error) throw new Error(String(payload.error))
-    return serpApiReversePayloadToResult(imageUrl, payload, maxResults)
+
+    // Image-bed mode: only upload when reverse search needs a public URL
+    if (publicOriginalUrl) return { publicUrl: publicOriginalUrl, cachedUrl: manifest?.url }
+    if (manifest?.imageBedUrl) return { publicUrl: manifest.imageBedUrl, cachedUrl: manifest.url }
+
+    // Need to upload — get image bytes (from local cache or download)
+    const downloaded = await downloadMediaFromUrl(imageUrl, this.config, {
+      kind: 'image',
+      referer: imageUrl.includes('qq.com') ? 'https://multimedia.nt.qq.com.cn/' : undefined
+    })
+    const upload = await uploadToImageBed(
+      downloaded.buffer, downloaded.filename, downloaded.mime,
+      this.config.publicAccess,
+      this.config.search.pageTimeoutMs
+    )
+    if (!upload.ok || !upload.publicUrl) throw new Error(upload.error || 'image bed upload failed')
+
+    // Write imageBedUrl back to existing manifest if available, otherwise create one
+    if (manifest?.manifest) {
+      await updateManagedCacheEntry(directory, manifest.manifest, {
+        imageBedUrl: upload.publicUrl,
+        imageBedProvider: upload.provider
+      })
+    } else {
+      await storeManagedAsset(this.ctx, this.config, downloaded.buffer, downloaded.filename, downloaded.mime, {
+        kind: 'image',
+        originalUrl: imageUrl,
+        imageBedUrl: upload.publicUrl,
+        imageBedProvider: upload.provider,
+        ...(this.session ? {
+          userId: this.session.userId, channelId: this.session.channelId,
+          guildId: this.session.guildId, platform: this.session.platform
+        } : undefined)
+      })
+    }
+
+    return { publicUrl: upload.publicUrl, cachedUrl: manifest?.url }
   }
 
   private async callSerpApiLens(imageUrl: string, maxResults: number): Promise<SerpApiLensResult> {
     const apiKey = (this.config.reverse.serpApiKey || this.config.search.serpApiKey).trim()
     if (!apiKey) throw new Error('missing SerpApi API key')
-    const publicImageUrl = rewriteImageUrlForPublicAccess(
-      imageUrl,
-      this.ctx.server?.selfUrl || '',
-      this.config.reverse.publicBaseUrl || this.config.delivery.publicBaseUrl
-    )
-    if (!isPublicHttpUrl(publicImageUrl)) {
+    if (!isPublicHttpUrl(imageUrl)) {
       throw new Error('SerpApi Google Lens requires a public image URL; the current URL looks private or local')
     }
     const response = await fetchWithTimeout(buildSerpApiGoogleLensUrl({
       apiKey,
-      imageUrl: publicImageUrl,
+      imageUrl,
       hl: this.config.search.serpApiHl || 'zh-cn',
       type: 'visual_matches'
     }), {
@@ -560,79 +283,10 @@ export class ReverseImageResolver {
         'Accept': 'application/json',
         'User-Agent': this.config.image.userAgent
       }
-    }, this.config.search.pageTimeoutMs, { noProxy: true })
+    }, this.config.search.pageTimeoutMs)
     const payload: any = await response.json()
     if (!response.ok) throw new Error(payload?.error || `SerpApi Google Lens HTTP ${response.status}`)
     if (payload?.error) throw new Error(String(payload.error))
     return serpApiLensPayloadToResult(imageUrl, payload, maxResults)
-  }
-
-  private async callGoogleVision(imageUrl: string, maxResults: number): Promise<GoogleReverseResult> {
-    if (!hasGoogleVisionCredentials(this.config)) throw new Error('missing Google Vision service-account credentials')
-    const imageResponse = await fetchWithTimeout(imageUrl, {
-      headers: {
-        'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'User-Agent': this.config.image.userAgent
-      }
-    }, this.config.search.pageTimeoutMs)
-    if (!imageResponse.ok) throw new Error(`fetch image failed: HTTP ${imageResponse.status}`)
-    const mime = (imageResponse.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
-    if (mime && !mime.startsWith('image/')) throw new Error(`fetch image failed: not image (${mime})`)
-    const buffer = Buffer.from(await imageResponse.arrayBuffer())
-    if (buffer.length > this.config.image.maxDownloadBytes) throw new Error(`image too large: ${buffer.length}`)
-
-    const auth = await googleVisionAuthHeaders(this.config)
-    const apiResponse = await fetchWithTimeout(
-      googleVisionAnnotateUrl(this.config),
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json; charset=utf-8',
-          'User-Agent': this.config.image.userAgent,
-          ...auth
-        },
-        body: JSON.stringify(buildGoogleVisionWebDetectionRequest(buffer, maxResults))
-      },
-      this.config.search.pageTimeoutMs
-    )
-    const payload: any = await apiResponse.json()
-    if (!apiResponse.ok) throw new Error(payload?.error?.message || `Google Vision HTTP ${apiResponse.status}`)
-    const first = payload?.responses?.[0]
-    if (first?.error?.message) throw new Error(first.error.message)
-    const web = first?.webDetection
-    if (!web) throw new Error('Google Vision did not return webDetection')
-    return {
-      provider: 'google',
-      imageUrl,
-      webDetection: normalizeWebDetection(web, maxResults)
-    }
-  }
-
-  private async cacheReverseInput(imageUrl: string, provider: 'serpapi' | 'serpapi-lens' | 'google') {
-    try {
-      const directory = join(this.ctx.baseDir, this.config.storage.localDirectory)
-      const existing = await findManagedCacheByCachedUrl(directory, imageUrl).catch(() => undefined)
-      const realOriginalUrl = existing?.originalUrl && existing.originalUrl !== existing.url
-        ? existing.originalUrl
-        : imageUrl
-
-      const downloaded = await downloadMediaFromUrl(imageUrl, this.config, {
-        kind: 'image',
-        referer: provider === 'serpapi-lens' ? 'https://lens.google.com/' : undefined
-      })
-      return await storeManagedAsset(this.ctx, this.config, downloaded.buffer, downloaded.filename, downloaded.mime, {
-        kind: 'reverse-image-input',
-        originalUrl: realOriginalUrl,
-        sourcePage: `reverse-provider:${provider}`,
-        ...(this.session ? {
-          userId: this.session.userId,
-          channelId: this.session.channelId,
-          guildId: this.session.guildId,
-          platform: this.session.platform
-        } : undefined)
-      })
-    } catch {
-      return undefined
-    }
   }
 }

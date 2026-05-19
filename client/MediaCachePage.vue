@@ -6,26 +6,17 @@
         <span class="mrc-header__desc">图片、语音和文件的转存记录与原始直链追踪</span>
       </div>
       <div class="mrc-header__actions">
-        <button type="button" class="mrc-btn" @click="diagnoseVision" :disabled="visionChecking">
-          {{ visionChecking ? '检测中...' : 'Vision 诊断' }}
-        </button>
         <button type="button" class="mrc-btn is-primary" @click="loadCache" :disabled="loading">
           {{ loading ? '加载中...' : '刷新' }}
         </button>
       </div>
     </header>
 
-    <section v-if="visionResult" :class="['mrc-alert', visionResult.ok ? 'is-ok' : 'is-bad']">
-      <strong>{{ visionResult.ok ? 'Google Vision 可用' : 'Google Vision 不可用' }}</strong>
-      <span>{{ visionResult.hint || visionResult.error || visionResult.reason }}</span>
-    </section>
-
     <section class="mrc-stats">
-      <div class="mrc-stat"><strong>{{ items.length }}</strong><span>缓存条目</span></div>
+      <div class="mrc-stat"><strong>{{ totalAll }}</strong><span>缓存条目</span></div>
       <div class="mrc-stat"><strong>{{ formatBytes(totalBytes) }}</strong><span>占用空间</span></div>
       <div class="mrc-stat"><strong>{{ latestTime }}</strong><span>最近写入</span></div>
       <div class="mrc-stat"><strong>{{ duplicateCount }}</strong><span>重复</span></div>
-      <div class="mrc-stat"><strong>{{ expiredCount }}</strong><span>已过期</span></div>
     </section>
 
     <nav class="mrc-toolbar">
@@ -54,6 +45,9 @@
           <button type="button" class="mrc-btn is-small is-danger" :disabled="!selected.size || deleting" @click="deleteSelected">
             删除 ({{ selected.size }})
           </button>
+          <button type="button" class="mrc-btn is-small" :disabled="!selected.size || archiving" @click="archiveSelected">
+            {{ archiving ? '打包中…' : `打包下载 (${selected.size})` }}
+          </button>
         </template>
         <span class="mrc-mgmt__sep"></span>
         <button type="button" class="mrc-btn is-small" :disabled="batchChecking || !items.length" @click="batchCheck">
@@ -67,6 +61,15 @@
         <span class="mrc-sweep-dot is-on"></span>
         <span>自动巡检 &middot; 每 5 分钟</span>
       </div>
+    </div>
+
+    <div class="mrc-kindbar">
+      <span class="mrc-kindbar__label" title="模型调用工具时，关闭的类型不会被写入缓存（不写文件、不入库、不传图床）。改动立即持久化。">缓存开关：</span>
+      <label v-for="opt in kindToggleOptions" :key="opt.kind" class="mrc-kindbar__toggle">
+        <input type="checkbox" :checked="cacheKinds[opt.kind]" @change="onKindToggle(opt.kind, ($event.target as HTMLInputElement).checked)" />
+        <span>{{ opt.label }}</span>
+      </label>
+      <span v-if="kindSaveError" class="mrc-kindbar__err">{{ kindSaveError }}</span>
     </div>
 
     <div v-if="error" class="mrc-notice is-error">{{ error }}</div>
@@ -90,10 +93,9 @@
           <div class="mrc-row__title">
             <strong :title="item.filename">{{ item.filename || '未命名' }}</strong>
             <span :class="['mrc-tag', `is-${mediaKindOf(item)}`]">{{ kindLabel(mediaKindOf(item)) }}</span>
-            <span v-if="item.originalUrlExpired" class="mrc-tag is-expired">已过期</span>
             <span v-if="isDuplicate(item)" class="mrc-tag is-dup">重复</span>
-            <span v-if="aliveStatus(item) === 'ok'" class="mrc-dot is-ok" title="原始可达"></span>
-            <span v-else-if="aliveStatus(item) === 'bad'" class="mrc-dot is-bad" title="原始不可达"></span>
+            <span v-if="aliveStatus(item) === 'ok'" class="mrc-dot is-ok" :title="aliveTooltip(item)"></span>
+            <span v-else-if="aliveStatus(item) === 'bad'" class="mrc-dot is-bad" :title="aliveTooltip(item)"></span>
           </div>
           <div class="mrc-row__meta">
             <span>{{ formatBytes(item.bytes) }}</span>
@@ -108,33 +110,51 @@
             <span class="mrc-row__url-label">缓存</span>
             <a :href="rewriteUrl(item.url)" target="_blank" rel="noreferrer" @click.stop>{{ rewriteUrl(item.url) }}</a>
           </div>
+          <div v-if="item.imageBedUrl" class="mrc-row__url" :title="item.imageBedUrl">
+            <span class="mrc-row__url-label is-imagebed">图床</span>
+            <a :href="item.imageBedUrl" target="_blank" rel="noreferrer" @click.stop>{{ item.imageBedUrl }}</a>
+          </div>
         </div>
       </div>
     </div>
+
+    <footer class="mrc-pager" v-if="totalPages > 1">
+      <button type="button" class="mrc-btn is-small" :disabled="page <= 1 || loading" @click="goPage(page - 1)">上一页</button>
+      <span>第 {{ page }} / {{ totalPages }} 页</span>
+      <button type="button" class="mrc-btn is-small" :disabled="!hasNext || loading" @click="goPage(page + 1)">下一页</button>
+    </footer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import type { ComputedRef } from 'vue'
 
-type MediaKind = 'image' | 'audio' | 'text' | 'file'
+type MediaKind = 'image' | 'audio' | 'file'
 type FilterKind = 'all' | MediaKind
 
 interface CacheItem {
   filename?: string
   manifest?: string
   url?: string
+  imageBedUrl?: string
   originalUrl?: string
   sourcePage?: string
   bytes?: number
   mime?: string
   kind?: string
-  originalUrlExpired?: boolean
   createdAt?: string
   mtime?: string
+  lastCheck?: { ok: boolean; status: number; checkedAt: string } | null
 }
 
-const publicPath = '/chatluna-image-resolver'
+interface CurrentSettings {
+  config?: Record<string, any>
+}
+
+const current = inject<ComputedRef<CurrentSettings>>('manager.settings.current', undefined)
+const runtimeStorage = computed(() => current?.value?.config?.storage?.cache || current?.value?.config?.storage || {})
+const publicPath = computed(() => runtimeStorage.value?.localPublicPath || '/chatluna-image-resolver')
 const items = ref<CacheItem[]>([])
 const activeKind = ref<FilterKind>('all')
 const searchQuery = ref('')
@@ -142,14 +162,25 @@ const urlContext = ref<'browser' | 'docker'>('browser')
 const selectMode = ref(false)
 const loading = ref(false)
 const deleting = ref(false)
+const archiving = ref(false)
 const batchChecking = ref(false)
 const batchProgress = ref(0)
 const batchTotal = ref(0)
 const error = ref('')
 const selected = reactive(new Set<string>())
 const checks = reactive<Record<string, { ok: boolean; status?: number }>>({})
-const visionChecking = ref(false)
-const visionResult = ref<any>(null)
+const page = ref(1)
+const pageSize = ref(50)
+const totalItems = ref(0)
+const hasNext = ref(false)
+const globalStats = ref<{ totalItems: number; totalBytes: number; latestMtime: string | null; byKind: Record<string, number> } | null>(null)
+const cacheKinds = reactive<{ image: boolean; audio: boolean; file: boolean }>({ image: true, audio: true, file: true })
+const kindSaveError = ref('')
+const kindToggleOptions: { kind: 'image' | 'audio' | 'file'; label: string }[] = [
+  { kind: 'image', label: '图片' },
+  { kind: 'audio', label: '语音' },
+  { kind: 'file', label: '文件' },
+]
 
 const browserOrigin = typeof window !== 'undefined' ? window.location.origin : ''
 const dockerPattern = /^https?:\/\/172\.\d+\.\d+\.\d+:\d+/
@@ -170,7 +201,8 @@ function mediaKindOf(item: CacheItem): MediaKind {
   const filename = String(item.filename || item.manifest || '').toLowerCase()
   if (mime.startsWith('image/') || /\.(jpe?g|png|webp|gif|avif|bmp|svg)(\.|$)/i.test(filename)) return 'image'
   if (mime.startsWith('audio/') || /\.(silk|amr|ogg|opus|mp3|wav|m4a|aac|flac)(\.|$)/i.test(filename)) return 'audio'
-  if (mime.startsWith('text/') || /\/(json|csv|yaml|xml)/.test(mime) || /\.(txt|md|csv|ya?ml|xml|log|ini)(\.|$)/i.test(filename)) return 'text'
+  // Text files (txt/md/json/...) are bucketed under "文件" — the bounded-preview
+  // logic still lives on the tool side, but UI treats them as one category.
   return 'file'
 }
 
@@ -199,10 +231,23 @@ function isDuplicate(item: CacheItem) {
 }
 
 function aliveStatus(item: CacheItem): 'ok' | 'bad' | '' {
-  if (item.originalUrlExpired) return 'bad'
-  const c = item.originalUrl ? checks[item.originalUrl] : undefined
-  if (!c) return ''
-  return c.ok ? 'ok' : 'bad'
+  // Prefer the in-memory result from the user-triggered "批量检测" (freshest),
+  // fall back to the DB-backed lastCheck row (survives page refresh).
+  const key = probeUrlFor(item)
+  const live = key ? checks[key] : undefined
+  if (live) return live.ok ? 'ok' : 'bad'
+  if (item.lastCheck) return item.lastCheck.ok ? 'ok' : 'bad'
+  return ''
+}
+
+function aliveTooltip(item: CacheItem): string {
+  const key = probeUrlFor(item)
+  const live = key ? checks[key] : undefined
+  const status = live ?? item.lastCheck
+  if (!status) return '未检测过'
+  const when = (status as any).checkedAt ? new Date((status as any).checkedAt).toLocaleString() : '刚刚'
+  const httpCode = status.status ? `HTTP ${status.status}` : (status.ok ? 'OK' : 'FAIL')
+  return `${status.ok ? '可达' : '不可达'} · ${httpCode} · 检测于 ${when}\n说明：仅反映本插件托管的 URL（图床或缓存）可达性，不反映上游原始 URL 是否仍存活。`
 }
 
 const filteredItems = computed(() => {
@@ -218,22 +263,33 @@ const filteredItems = computed(() => {
 })
 
 const displayItems = filteredItems
-const totalBytes = computed(() => items.value.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0))
-const expiredCount = computed(() => items.value.filter((item) => item.originalUrlExpired).length)
+const totalBytes = computed(() => globalStats.value?.totalBytes ?? items.value.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0))
 const duplicateCount = computed(() => duplicateManifests.value.size)
 const latestTime = computed(() => {
-  const latest = items.value[0]?.createdAt || items.value[0]?.mtime
+  const latest = globalStats.value?.latestMtime || items.value[0]?.createdAt || items.value[0]?.mtime
   return latest ? formatTime(latest, true) : '-'
 })
+const totalAll = computed(() => globalStats.value?.totalItems ?? items.value.length)
+const totalPages = computed(() => Math.max(1, Math.ceil(totalItems.value / pageSize.value)))
 
 const filterOptions = computed(() => {
-  const count = (kind: FilterKind) => kind === 'all' ? items.value.length : items.value.filter((item) => mediaKindOf(item) === kind).length
+  const byKind = globalStats.value?.byKind
+  // Roll backend's separate `text` kind into the unified "文件" bucket so the
+  // chip count matches what the panel shows.
+  const fileGlobalCount = byKind ? (byKind['file'] || 0) + (byKind['text'] || 0) : 0
+  const countOf = (kind: FilterKind) => {
+    if (byKind) {
+      if (kind === 'all') return globalStats.value!.totalItems
+      if (kind === 'file') return fileGlobalCount
+      return byKind[kind] || 0
+    }
+    return kind === 'all' ? items.value.length : items.value.filter((item) => mediaKindOf(item) === kind).length
+  }
   return [
-    { value: 'all' as FilterKind, label: '全部', count: count('all') },
-    { value: 'image' as FilterKind, label: '图片', count: count('image') },
-    { value: 'audio' as FilterKind, label: '语音', count: count('audio') },
-    { value: 'text' as FilterKind, label: '文本', count: count('text') },
-    { value: 'file' as FilterKind, label: '文件', count: count('file') },
+    { value: 'all' as FilterKind, label: '全部', count: countOf('all') },
+    { value: 'image' as FilterKind, label: '图片', count: countOf('image') },
+    { value: 'audio' as FilterKind, label: '语音', count: countOf('audio') },
+    { value: 'file' as FilterKind, label: '文件', count: countOf('file') },
   ]
 })
 
@@ -256,7 +312,7 @@ function selectAll() {
 }
 
 async function deleteManifests(manifests: string[]) {
-  const response = await fetch(`${publicPath}/_cache/delete`, {
+  const response = await fetch(`${publicPath.value}/_cache/delete`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ manifests })
@@ -280,6 +336,35 @@ async function deleteSelected() {
   }
 }
 
+async function archiveSelected() {
+  if (!selected.size) return
+  archiving.value = true
+  error.value = ''
+  try {
+    const response = await fetch(`${publicPath.value}/_cache/archive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manifests: [...selected] })
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    const cd = response.headers.get('Content-Disposition') || ''
+    const match = cd.match(/filename="?([^"]+)"?/)
+    a.download = match?.[1] || `chatluna-cache-${Date.now()}.zip`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 30000)
+  } catch (err) {
+    error.value = `打包下载失败: ${err instanceof Error ? err.message : String(err)}`
+  } finally {
+    archiving.value = false
+  }
+}
+
 async function autoDedup() {
   const dups = [...duplicateManifests.value]
   if (!dups.length) return
@@ -295,10 +380,16 @@ async function autoDedup() {
   }
 }
 
+function probeUrlFor(item: CacheItem): string {
+  // In image-bed mode the durable URL is imageBedUrl. In self-hosted mode
+  // (or when upload failed) we fall back to the local URL.
+  return item.imageBedUrl || rewriteUrl(item.url)
+}
+
 async function batchCheck() {
-  const toCheck = items.value.filter((item) => item.originalUrl && !checks[item.originalUrl])
+  const toCheck = items.value.filter((item) => probeUrlFor(item) && !checks[probeUrlFor(item)])
   if (!toCheck.length) {
-    const all = items.value.filter((item) => item.originalUrl)
+    const all = items.value.filter((item) => probeUrlFor(item))
     if (all.length) {
       for (const key of Object.keys(checks)) delete checks[key]
       return batchCheck()
@@ -312,19 +403,19 @@ async function batchCheck() {
   for (let i = 0; i < toCheck.length; i += batchSize) {
     const batch = toCheck.slice(i, i + batchSize)
     await Promise.all(batch.map(async (item) => {
+      const probeUrl = probeUrlFor(item)
       try {
         const manifest = item.manifest ? `&manifest=${encodeURIComponent(item.manifest)}` : ''
-        const url = `${publicPath}/_cache/check?url=${encodeURIComponent(item.originalUrl!)}${manifest}`
+        const url = `${publicPath.value}/_cache/check?url=${encodeURIComponent(probeUrl)}${manifest}`
         const response = await fetch(url)
         const result = response.ok ? await response.json() : { ok: false, status: response.status }
-        checks[item.originalUrl!] = result
-        if (result.ok === false) item.originalUrlExpired = true
+        checks[probeUrl] = result
       } catch {
-        checks[item.originalUrl!] = { ok: false, status: 0 }
-        item.originalUrlExpired = true
+        checks[probeUrl] = { ok: false, status: 0 }
+      } finally {
+        batchProgress.value++
       }
     }))
-    batchProgress.value = Math.min(i + batchSize, toCheck.length)
   }
   batchChecking.value = false
 }
@@ -333,12 +424,22 @@ async function loadCache() {
   loading.value = true
   error.value = ''
   try {
-    const response = await fetch(`${publicPath}/_cache`)
+    const params = new URLSearchParams({
+      page: String(page.value),
+      pageSize: String(pageSize.value)
+    })
+    const q = searchQuery.value.trim()
+    if (q) params.set('q', q)
+    if (activeKind.value !== 'all') params.set('kind', activeKind.value)
+    const response = await fetch(`${publicPath.value}/_cache?${params}`)
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const data = await response.json()
     items.value = Array.isArray(data.items)
       ? data.items.slice().sort((a: CacheItem, b: CacheItem) => String(b.createdAt || b.mtime).localeCompare(String(a.createdAt || a.mtime)))
       : []
+    totalItems.value = Number(data.total ?? items.value.length)
+    hasNext.value = Boolean(data.hasNext)
+    globalStats.value = data.globalStats || null
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -346,17 +447,9 @@ async function loadCache() {
   }
 }
 
-async function diagnoseVision() {
-  visionChecking.value = true
-  visionResult.value = null
-  try {
-    const response = await fetch(`${publicPath}/_diagnostics/google-vision`, { method: 'POST' })
-    visionResult.value = response.ok ? await response.json() : { ok: false, status: response.status, error: `HTTP ${response.status}` }
-  } catch (err) {
-    visionResult.value = { ok: false, error: err instanceof Error ? err.message : String(err) }
-  } finally {
-    visionChecking.value = false
-  }
+function goPage(next: number) {
+  page.value = Math.min(totalPages.value, Math.max(1, next))
+  loadCache()
 }
 
 function onImgFallback(e: Event, item: CacheItem) {
@@ -373,10 +466,10 @@ function onImgFallback(e: Event, item: CacheItem) {
 }
 
 function kindLabel(kind: string) {
-  return ({ image: '图片', audio: '语音', text: '文本', file: '文件' } as any)[kind] || kind
+  return ({ image: '图片', audio: '语音', file: '文件' } as any)[kind] || '文件'
 }
 function kindIcon(kind: string) {
-  return ({ image: 'IMG', audio: 'AUD', text: 'TXT', file: 'FILE' } as any)[kind] || 'F'
+  return ({ image: 'IMG', audio: 'AUD', file: 'FILE' } as any)[kind] || 'FILE'
 }
 function formatBytes(value?: number) {
   if (!value) return '0 B'
@@ -392,14 +485,52 @@ function formatTime(value?: string, compact = false) {
 }
 
 const scrollStyleId = 'mrc-scrollbar-fix'
+async function loadCacheKindSettings() {
+  try {
+    const response = await fetch(`${publicPath.value}/_cache/settings`)
+    if (!response.ok) return
+    const data = await response.json()
+    const kinds = data?.kinds || {}
+    cacheKinds.image = kinds.image !== false
+    cacheKinds.audio = kinds.audio !== false
+    cacheKinds.file = kinds.file !== false
+  } catch {}
+}
+
+async function onKindToggle(kind: 'image' | 'audio' | 'file', value: boolean) {
+  cacheKinds[kind] = value
+  kindSaveError.value = ''
+  try {
+    const response = await fetch(`${publicPath.value}/_cache/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kinds: { [kind]: value } })
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const data = await response.json()
+    const kinds = data?.kinds || {}
+    cacheKinds.image = kinds.image !== false
+    cacheKinds.audio = kinds.audio !== false
+    cacheKinds.file = kinds.file !== false
+  } catch (err) {
+    cacheKinds[kind] = !value
+    kindSaveError.value = `保存失败: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
 onMounted(() => {
   loadCache()
+  loadCacheKindSettings()
   if (!document.getElementById(scrollStyleId)) {
     const s = document.createElement('style')
     s.id = scrollStyleId
     s.textContent = `html,body,.layout-main,.k-content,.page-content,.el-scrollbar__wrap{scrollbar-width:thin!important;scrollbar-color:rgba(144,147,153,.3) transparent!important}html::-webkit-scrollbar,body::-webkit-scrollbar,.layout-main::-webkit-scrollbar,.k-content::-webkit-scrollbar,.page-content::-webkit-scrollbar,.el-scrollbar__wrap::-webkit-scrollbar{width:5px!important}html::-webkit-scrollbar-track,body::-webkit-scrollbar-track,.layout-main::-webkit-scrollbar-track,.k-content::-webkit-scrollbar-track,.page-content::-webkit-scrollbar-track,.el-scrollbar__wrap::-webkit-scrollbar-track{background:transparent!important}html::-webkit-scrollbar-thumb,body::-webkit-scrollbar-thumb,.layout-main::-webkit-scrollbar-thumb,.k-content::-webkit-scrollbar-thumb,.page-content::-webkit-scrollbar-thumb,.el-scrollbar__wrap::-webkit-scrollbar-thumb{background:rgba(144,147,153,.3)!important;border-radius:999px!important}html::-webkit-scrollbar-thumb:hover,body::-webkit-scrollbar-thumb:hover,.layout-main::-webkit-scrollbar-thumb:hover,.k-content::-webkit-scrollbar-thumb:hover,.page-content::-webkit-scrollbar-thumb:hover,.el-scrollbar__wrap::-webkit-scrollbar-thumb:hover{background:rgba(124,92,255,.5)!important}`
     document.head.appendChild(s)
   }
+})
+watch([activeKind, searchQuery], () => {
+  page.value = 1
+  loadCache()
 })
 onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 </script>
@@ -412,7 +543,7 @@ onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 .mrc-header__desc { display: block; margin-top: 2px; color: var(--k-text-light); font-size: 12px; }
 .mrc-header__actions { display: flex; gap: 6px; flex-shrink: 0; }
 
-.mrc-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; overflow: hidden; margin: 12px 0; border: 1px solid var(--k-color-divider, #ebeef5); border-radius: 8px; background: var(--k-color-divider, #ebeef5); }
+.mrc-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; overflow: hidden; margin: 12px 0; border: 1px solid var(--k-color-divider, #ebeef5); border-radius: 8px; background: var(--k-color-divider, #ebeef5); }
 .mrc-stat { padding: 10px 12px; background: var(--k-card-bg, #fff); }
 .mrc-stat strong { display: block; font-size: 17px; line-height: 1.2; }
 .mrc-stat span { display: block; margin-top: 2px; color: var(--k-text-light); font-size: 11px; }
@@ -443,9 +574,15 @@ onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 .mrc-sweep-dot.is-on { background: #18a058; box-shadow: 0 0 4px #18a05866; }
 
 .mrc-notice { padding: 10px; border-radius: 6px; background: var(--k-hover-bg); color: var(--k-text-light); font-size: 12px; }
+.mrc-kindbar { display: flex; align-items: center; gap: 12px; margin: 0 0 10px; padding: 6px 10px; border-radius: 6px; background: var(--k-hover-bg); font-size: 12px; flex-wrap: wrap; }
+.mrc-kindbar__label { color: var(--k-text-light); }
+.mrc-kindbar__toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.mrc-kindbar__toggle input { accent-color: var(--k-color-primary); cursor: pointer; }
+.mrc-kindbar__err { color: #d03050; }
 .mrc-notice.is-error { border: 1px solid #e88080; color: #d03050; }
 
 .mrc-table { border-top: 1px solid var(--k-color-divider, #ebeef5); }
+.mrc-pager { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 12px 0 0; color: var(--k-text-light); font-size: 12px; }
 
 .mrc-row { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--k-color-divider, #ebeef5); transition: background .1s; }
 .mrc-row.is-selecting { grid-template-columns: 24px 40px minmax(0, 1fr); cursor: pointer; }
@@ -466,8 +603,6 @@ onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 .mrc-tag { flex-shrink: 0; padding: 0 5px; border: 1px solid var(--k-color-divider, #dcdfe6); border-radius: 999px; font-size: 10px; color: var(--k-text-light); line-height: 1.6; }
 .mrc-tag.is-image { border-color: #7c5cff; color: #7c5cff; }
 .mrc-tag.is-audio { border-color: #f0a020; color: #f0a020; }
-.mrc-tag.is-text { border-color: #18a058; color: #18a058; }
-.mrc-tag.is-expired { border-color: #e88080; color: #d03050; }
 .mrc-tag.is-dup { border-color: #f0a020; color: #f0a020; }
 
 .mrc-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; display: inline-block; }
@@ -477,6 +612,7 @@ onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 .mrc-row__meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; color: var(--k-text-light); font-size: 11px; }
 .mrc-row__url { display: flex; align-items: center; gap: 4px; margin-top: 1px; min-width: 0; }
 .mrc-row__url-label { flex-shrink: 0; padding: 0 4px; border-radius: 3px; background: var(--k-hover-bg); color: var(--k-text-light); font-size: 10px; line-height: 1.6; }
+.mrc-row__url-label.is-imagebed { background: color-mix(in srgb, #7c5cff 18%, transparent); color: #7c5cff; }
 .mrc-row__url a { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--k-text-light); font-size: 11px; }
 .mrc-row__url a:hover { color: var(--k-color-primary); }
 
@@ -493,7 +629,7 @@ onUnmounted(() => { document.getElementById(scrollStyleId)?.remove() })
 @media (max-width: 720px) {
   .mrc-page { padding: 12px; }
   .mrc-header { flex-direction: column; align-items: stretch; }
-  .mrc-stats { grid-template-columns: repeat(3, 1fr); }
+  .mrc-stats { grid-template-columns: repeat(2, 1fr); }
   .mrc-toolbar, .mrc-mgmt { flex-direction: column; align-items: stretch; }
   .mrc-toolbar__right { flex-direction: column; }
   .mrc-search__input { width: 100%; min-width: 0; }

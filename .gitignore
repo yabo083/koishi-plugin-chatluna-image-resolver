@@ -5,3 +5,14 @@ yarn-error.log*
 
 chatluna-latest.log
 tsconfig.tsbuildinfo
+dist
+.claude
+lib
+
+# Test fixtures kept out of git for size reasons; provide your own if running
+# the R2 integration test against a real fixture (the test itself uses an
+# inlined 1×1 PNG, so this is optional).
+tests/test.png
+
+# Internal planning notes; not part of the published package.
+docs/plans/

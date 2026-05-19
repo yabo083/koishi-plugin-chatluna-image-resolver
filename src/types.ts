@@ -1,3 +1,4 @@
+/** @deprecated Use `publicAccess` image-bed WebDAV config instead. Will be removed in a future version. */
 export interface WebDavConfig {
   enabled: boolean
   endpoint: string
@@ -7,14 +8,12 @@ export interface WebDavConfig {
   publicBaseUrl: string
 }
 
+export type ImageBedProvider = 's3' | 'webdav'
+export type PublicAccessMode = 'self-hosted' | 'image-bed'
+
 export interface Config {
   credentials: {
     serpApiKey: string
-    googleClientEmail: string
-    googlePrivateKey: string
-    googleProjectId: string
-    googleTokenUri: string
-    googleApiKey: string
   }
   tool: {
     enabled: boolean
@@ -43,13 +42,10 @@ export interface Config {
     enabled: boolean
     toolName: string
     description: string
-    provider: 'auto' | 'serpapi-lens' | 'google'
+    provider: 'serpapi-lens'
     serpApiKey: string
     serpApiGoogleDomain: string
-    googleApiKey: string
-    googleServiceAccountJson: string
     maxResults: number
-    publicBaseUrl: string
     customPrompt: string
   }
   qqMedia: {
@@ -66,15 +62,31 @@ export interface Config {
     localDirectory: string
     localPublicPath: string
     retentionDays: number
-    expiredRetentionDays: number
-    expiredRetentionMinutes: number
     cleanupIntervalMinutes: number
     livenessCheckBatchSize: number
     cleanupIntervalHours: number
-    autoRevive: boolean
+    imageBedLocalBufferHours: number
+    coldThresholdDays: number
   }
   delivery: {
     publicBaseUrl: string
+  }
+  publicAccess: {
+    mode: PublicAccessMode
+    publicBaseUrl: string
+    imageBedProvider: ImageBedProvider
+    s3Endpoint: string
+    s3Region: string
+    s3Bucket: string
+    s3AccessKeyId: string
+    s3SecretAccessKey: string
+    s3PathPrefix: string
+    s3PublicUrl: string
+    webdavEndpoint: string
+    webdavUsername: string
+    webdavPassword: string
+    webdavBasePath: string
+    webdavPublicUrl: string
   }
   network: {
     useChatLunaProxy: boolean
@@ -84,9 +96,7 @@ export interface Config {
 }
 
 export interface ConfigInput {
-  credentials?: Partial<Config['credentials']> & {
-    googleServiceAccountJson?: string
-  }
+  credentials?: Partial<Config['credentials']>
   features?: {
     tool?: Partial<Config['tool']>
     reverse?: Pick<Config['reverse'], 'enabled' | 'toolName' | 'description'>
@@ -116,16 +126,13 @@ export interface ConfigInput {
     minHeight?: number
   }
   reverseSearch?: {
-    provider?: Pick<Partial<Config['reverse']>, 'provider' | 'serpApiKey' | 'serpApiGoogleDomain' | 'googleApiKey' | 'googleServiceAccountJson'>
+    provider?: Pick<Partial<Config['reverse']>, 'provider' | 'serpApiKey' | 'serpApiGoogleDomain'>
       | Config['reverse']['provider']
     serpApiKey?: string
     serpApiGoogleDomain?: string
-    googleApiKey?: string
-    googleServiceAccountJson?: string
     maxResults?: number
-    publicBaseUrl?: string
     customPrompt?: string
-    behavior?: Pick<Partial<Config['reverse']>, 'maxResults' | 'publicBaseUrl' | 'customPrompt'>
+    behavior?: Pick<Partial<Config['reverse']>, 'maxResults' | 'customPrompt'>
   }
   qqMedia?: {
     tracking?: Pick<Partial<Config['qqMedia']>, 'maxTrackedMessages'>
@@ -140,12 +147,9 @@ export interface ConfigInput {
       localFallback?: boolean
       localDirectory?: string
       localPublicPath?: string
-      expiredRetentionMinutes?: number
-      expiredRetentionHours?: number
       cleanupIntervalMinutes?: number
       livenessCheckBatchSize?: number
       cleanupIntervalHours?: number
-      autoRevive?: boolean
     }
     delivery?: Partial<Config['delivery']>
     webdav?: Partial<WebDavConfig>
@@ -153,8 +157,6 @@ export interface ConfigInput {
     localFallback?: boolean
     localDirectory?: string
     localPublicPath?: string
-    expiredRetentionMinutes?: number
-    expiredRetentionHours?: number
     cleanupIntervalMinutes?: number
     livenessCheckBatchSize?: number
     cleanupIntervalHours?: number
@@ -181,12 +183,30 @@ export interface ConfigInput {
     useChatLunaProxy?: boolean
     logging?: boolean
   }
+  publicAccess?: {
+    mode?: PublicAccessMode
+    publicBaseUrl?: string
+    imageBedProvider?: ImageBedProvider
+    s3Endpoint?: string
+    s3Region?: string
+    s3Bucket?: string
+    s3AccessKeyId?: string
+    s3SecretAccessKey?: string
+    s3PathPrefix?: string
+    s3PublicUrl?: string
+    webdavEndpoint?: string
+    webdavUsername?: string
+    webdavPassword?: string
+    webdavBasePath?: string
+    webdavPublicUrl?: string
+  }
 }
 
 export interface ImageCandidate {
   url: string
   sourcePage: string
   score: number
+  title?: string
   width?: number
   height?: number
   reason: string
@@ -194,7 +214,7 @@ export interface ImageCandidate {
 
 export interface StoredImage {
   url: string
-  webdavUrl?: string
+  imageBedUrl?: string
   originalUrl: string
   sourcePage: string
   width?: number
@@ -208,6 +228,7 @@ export interface QQImageRecord {
   channelId: string
   guildId: string
   userId: string
+  platform?: string
   timestamp: number
   images: Array<{
     src: string
@@ -229,37 +250,6 @@ export interface TrackedMedia {
   mime?: string
   duration?: number
   attrs: Record<string, unknown>
-}
-
-export interface WebDetection {
-  webEntities?: Array<{ entityId?: string; score?: number; description?: string }>
-  fullMatchingImages?: Array<{ url?: string }>
-  partialMatchingImages?: Array<{ url?: string }>
-  pagesWithMatchingImages?: Array<{ url?: string; pageTitle?: string }>
-  visuallySimilarImages?: Array<{ url?: string }>
-  bestGuessLabels?: Array<{ label?: string; languageCode?: string }>
-}
-
-export interface GoogleReverseResult {
-  provider: 'google'
-  imageUrl: string
-  webDetection: WebDetection
-  note?: string
-}
-
-export interface SerpApiReverseResult {
-  provider: 'serpapi'
-  imageUrl: string
-  searchInformation?: unknown
-  imageResults: Array<{
-    position?: number
-    title?: string
-    link?: string
-    source?: string
-    thumbnail?: string
-    original?: string
-  }>
-  note?: string
 }
 
 export interface SerpApiLensResult {
@@ -284,4 +274,158 @@ export interface SerpApiLensResult {
     serpapiLink?: string
   }>
   note?: string
+}
+
+export interface ImageBedUploadResult {
+  ok: boolean
+  publicUrl?: string
+  provider?: ImageBedProvider
+  error?: string
+}
+
+export type ManagedAssetKind =
+  | 'image' | 'audio' | 'text' | 'file'
+  | 'keyword-search'
+  | 'reverse-image'
+
+export interface ManagedAssetManifest {
+  // --- Core (always present) ---
+  filename: string
+  url: string
+  mime: string
+  bytes: number
+  createdAt: string
+  retentionDays: number
+  storage: 'local' | 'image-bed'
+  kind: ManagedAssetKind
+
+  // --- Origin ---
+  originalUrl?: string
+  sourcePage?: string
+
+  // --- Semantic (keyword-search only) ---
+  searchQuery?: string
+  batchId?: string
+  pageTitle?: string
+  tags?: string[]
+
+  // --- Physical (auto-computed by storeManagedAsset) ---
+  width?: number
+  height?: number
+  orientation?: 'landscape' | 'portrait' | 'square'
+  aspectRatio?: number
+  isAnimated?: boolean
+  phash?: string
+
+  // --- Public access ---
+  imageBedUrl?: string
+  imageBedProvider?: string
+
+  // --- Platform context ---
+  userId?: string
+  channelId?: string
+  guildId?: string
+  platform?: string
+
+  // --- QQ media specific ---
+  messageId?: string
+  mediaIndex?: number
+  file?: string
+  fileName?: string
+  fileSize?: number
+  duration?: number
+
+  // --- Search result provenance ---
+  reason?: string
+
+  // --- Liveness tracking (written by sweep/check) ---
+  originalUrlLastCheck?: {
+    ok: boolean
+    status?: number
+    contentType?: string
+    error?: string
+    checkedAt?: string
+  }
+  publicUrlLastCheck?: {
+    ok: boolean
+    status?: number
+    contentType?: string
+    contentLength?: string
+    error?: string
+    checkedAt?: string
+  }
+}
+
+export type ManagedAssetMetadata = Partial<Omit<ManagedAssetManifest, 'filename' | 'url' | 'mime' | 'bytes' | 'createdAt' | 'retentionDays'>>
+
+export type MediaAssetStorage = 'local' | 'image-bed'
+export type MediaAssetSourceType = 'keyword-search' | 'qq-media' | 'manual' | 'reverse-input'
+export type MediaAssetCacheTier = 'hot' | 'warm' | 'cold'
+export type MediaAliasType = 'original-url' | 'public-url' | 'cached-url' | 'message-id' | 'sha1' | 'phash' | 'source-page'
+export type MediaTagSource = 'query' | 'serpapi-title' | 'manual' | 'filename'
+
+export interface MiyakoMediaAsset {
+  id: string
+  filename: string
+  url: string
+  publicUrl: string
+  imageBedUrl: string
+  storage: MediaAssetStorage
+  kind: ManagedAssetKind
+  mime: string
+  bytes: number
+  sha1: string
+  phash: string
+  width: number
+  height: number
+  orientation: '' | 'landscape' | 'portrait' | 'square'
+  isAnimated: boolean
+  nsfw: boolean
+  createdAt: Date
+  updatedAt: Date
+  lastAccessedAt: Date
+  accessCount: number
+  cacheTier: MediaAssetCacheTier
+  sourceType: MediaAssetSourceType
+  searchQuery: string
+  batchId: string
+  pageTitle: string
+  sourcePage: string
+  originalUrl: string
+  userId: string
+  channelId: string
+  guildId: string
+  platform: string
+  messageId: string
+  mediaIndex: number
+  originalFilename: string
+  fileSize: number
+  duration: number
+}
+
+export interface MiyakoMediaAlias {
+  id: string
+  assetId: string
+  type: MediaAliasType
+  value: string
+  createdAt: Date
+}
+
+export interface MiyakoMediaTag {
+  id: string
+  assetId: string
+  tag: string
+  source: MediaTagSource
+}
+
+export interface MiyakoMediaPublicCheck {
+  id: string
+  assetId: string
+  publicUrl: string
+  ok: boolean
+  status: number
+  contentType: string
+  contentLength: string
+  error: string
+  checkedAt: Date
 }

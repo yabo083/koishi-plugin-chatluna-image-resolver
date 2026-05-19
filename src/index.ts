@@ -1,24 +1,24 @@
 import { Context, h, Schema } from 'koishi'
 import { StructuredTool } from '@langchain/core/tools'
 import { z } from 'zod'
-import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { readFile, unlink } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import type {
   Config as ResolverConfig,
   ConfigInput,
-  GoogleReverseResult,
   ImageCandidate,
+  ManagedAssetMetadata,
   QQImageRecord,
-  SerpApiLensResult,
-  SerpApiReverseResult,
   StoredImage,
   TrackedMedia,
-  TrackedMediaKind,
-  WebDavConfig,
-  WebDetection
+  TrackedMediaKind
 } from './types'
-import { diagnoseGoogleVision, ImageResolver, ReverseImageResolver, selectReverseProvider } from './resolvers'
+import { ImageResolver, ReverseImageResolver } from './resolvers'
 import { QQImageTracker } from './tracker'
+import { registerCacheModels, searchAssets, purgeAssetsByFilename, recordPublicCheck } from './cache-store'
+import { deleteFromImageBed } from './imagebed'
+import { migrateManifestDirectory } from './cache-migration'
+import { getCacheKinds, loadCacheKinds, saveCacheKinds } from './cache-settings'
 import {
   checkRemoteImageAlive,
   cleanupManagedImageCache,
@@ -26,22 +26,22 @@ import {
   findManagedCacheByCachedUrl,
   findManagedCacheByOriginalUrl,
   listManagedImageCache,
-  markManagedCacheEntryExpired,
   readJsonBody,
+  resolveLiveCachedUrl,
+  runColdPurge,
   searchManagedCache,
   storeManagedAsset,
-  sweepManagedCacheOriginalUrls,
-  writeManagedAssetManifest
+  updateManagedCacheEntry
 } from './cache'
+import { checkPublicUrl, sweepManagedCachePublicUrls } from './public-access'
 import {
-  buildGoogleVisionWebDetectionRequest,
-  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
-  buildSerpApiReverseImageUrl,
+  checkSerpApiAccount,
   clamp,
   configureFetchProxy,
   detectManagedAssetKind,
+  fetchWithTimeout,
   formatError,
   isPublicHttpUrl,
   mimeFromFilename,
@@ -50,12 +50,11 @@ import {
   rewriteUrlBase,
   serpApiImagesToCandidates,
   serpApiLensPayloadToResult,
-  serpApiReversePayloadToResult,
   trimTrailingSlash
 } from './utils'
 
 export const name = 'miyako-chatluna-media-resolver'
-export const inject = { optional: ['chatluna', 'server', 'console'] as const }
+export const inject = { optional: ['chatluna', 'server', 'console', 'database'] as const }
 
 export type Config = ResolverConfig
 export type { ConfigInput }
@@ -67,29 +66,42 @@ export {
   findManagedCacheByOriginalUrl,
   isManagedCacheFilename,
   listManagedImageCache,
-  markManagedCacheEntryChecked,
-  markManagedCacheEntryExpired,
   searchManagedCache,
-  sweepManagedCacheOriginalUrls,
   storeManagedAsset
 } from './cache'
+export { checkPublicUrl, sweepManagedCachePublicUrls } from './public-access'
 export {
-  buildGoogleVisionWebDetectionRequest,
-  buildGoogleVisionWebDetectionUriRequest,
   buildSerpApiGoogleLensUrl,
   buildSerpApiImagesUrl,
-  buildSerpApiReverseImageUrl,
+  checkSerpApiAccount,
+  computeAspectRatio,
+  computeOrientation,
+  detectIsAnimated,
   detectManagedAssetKind,
+  extractPageTitle,
+  extractTagsFromQuery,
+  generateBatchId,
   isPublicHttpUrl,
   mimeFromFilename,
   rewriteImageUrlForPublicAccess,
   rewriteUrlBase,
   serpApiImagesToCandidates,
   serpApiLensPayloadToResult,
-  serpApiReversePayloadToResult,
   trimTrailingSlash
 } from './utils'
-export { selectReverseProvider } from './resolvers'
+export type { ManagedAssetManifest, ManagedAssetMetadata, ManagedAssetKind } from './types'
+export {
+  findAssetByAnyUrl,
+  findAssetsByMessage,
+  listDuePublicChecks,
+  purgeAssetsByFilename,
+  recordPublicCheck,
+  registerCacheModels,
+  searchAssets,
+  touchAsset,
+  upsertAsset
+} from './cache-store'
+export { manifestToAssetInput, migrateManifestDirectory } from './cache-migration'
 
 const TOOL_SCHEMA = z.object({
   query: z.string().min(1).describe('Image search query, for example "天童爱丽丝 普通图片" or "Tendou Aris fanart".'),
@@ -98,8 +110,7 @@ const TOOL_SCHEMA = z.object({
 })
 
 const REVERSE_TOOL_SCHEMA = z.object({
-  imageUrl: z.string().url().describe('Image URL to reverse search. Google Vision uses service-account OAuth and downloaded image bytes; SerpApi URL-based providers require a public URL.'),
-  provider: z.enum(['auto', 'serpapi-lens', 'google']).optional().describe('Override the reverse-search provider. Auto tries the best provider first and falls back to the other on failure.'),
+  imageUrl: z.string().url().describe('Image URL to reverse search. SerpApi URL-based providers require a public URL.'),
   maxResults: z.number().int().min(1).max(50).optional().describe('Maximum reverse-search results. Defaults to the plugin config.')
 })
 
@@ -111,7 +122,8 @@ const QQ_MEDIA_TOOL_SCHEMA = z.object({
   cache: z.boolean().optional().describe('Download and store the media in the managed cache. Defaults to plugin config.'),
   target: z.enum(['auto', 'serpapi', 'google', 'chatluna']).optional().describe('Consumer that needs the media URL. Defaults to auto.'),
   readText: z.boolean().optional().describe('For text files, include a bounded UTF-8 text preview. Defaults to true for text files.'),
-  maxTextBytes: z.number().int().min(256).max(262144).optional().describe('Maximum bytes to include in text preview. Defaults to plugin config.')
+  maxTextBytes: z.number().int().min(256).max(262144).optional().describe('Maximum bytes to include in text preview. Defaults to plugin config.'),
+  all: z.boolean().optional().describe('Return and optionally cache all media elements in the message. Defaults to true when no mediaIndex/imageIndex is provided.')
 })
 
 const QQ_MEDIA_CACHE_LOOKUP_SCHEMA = z.object({
@@ -128,23 +140,42 @@ const QQ_MEDIA_CACHE_LOOKUP_SCHEMA = z.object({
 
 export const Config: Schema<any> = Schema.object({
   credentials: Schema.object({
-    serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key。获取方式：登录 serpapi.com，在 Dashboard / API Key 页面复制。以文搜图和 SerpApi 反搜都会复用这一处。'),
-    googleClientEmail: Schema.string().default('').description('Google Cloud 服务账号 client_email。获取方式：Google Cloud Console -> IAM 和管理 -> 服务账号 -> 创建密钥，下载 JSON 后只复制 client_email 字段。'),
-    googlePrivateKey: Schema.string().role('secret').default('').description('Google Cloud 服务账号 private_key。只复制 JSON 里的 private_key 字段；可保留 JSON 中的 \\n 转义换行。项目需启用 Cloud Vision API。'),
-    googleProjectId: Schema.string().default('').description('Google Cloud 项目 ID，仅用于辅助识别配置；认证实际使用 client_email 与 private_key。'),
-    googleTokenUri: Schema.string().default('https://oauth2.googleapis.com/token').description('Google OAuth token_uri。通常保持默认；如果服务账号 JSON 中 token_uri 不同，再复制该字段。'),
-    googleApiKey: Schema.string().role('secret').default('').description('旧版兼容字段：Google Cloud Vision API Key。新配置请优先使用服务账号 client_email/private_key。')
+    serpApiKey: Schema.string().role('secret').default('').description('SerpApi API Key。获取方式：登录 serpapi.com，在 Dashboard / API Key 页面复制。以文搜图和 SerpApi 反搜都会复用这一处。')
   }).description('API 凭据'),
+  publicAccess: Schema.union([
+    Schema.object({
+      mode: Schema.const('self-hosted').default('self-hosted').description('自建公网 URL'),
+      publicBaseUrl: Schema.string().default('').description('公网根地址，如 https://bot.example.com:5140')
+    }).description('自建公网'),
+    Schema.object({
+      mode: Schema.const('image-bed-s3').default('image-bed-s3').description('图床托管 · S3'),
+      s3Endpoint: Schema.string().default('').description('S3 端点，如 https://s3.amazonaws.com 或 https://<id>.r2.cloudflarestorage.com'),
+      s3Region: Schema.string().default('auto').description('S3 区域。Cloudflare R2 填 auto。'),
+      s3Bucket: Schema.string().default('').description('S3 存储桶名称。'),
+      s3AccessKeyId: Schema.string().default('').description('S3 Access Key ID。'),
+      s3SecretAccessKey: Schema.string().role('secret').default('').description('S3 Secret Access Key。'),
+      s3PathPrefix: Schema.string().default('chatluna-images').description('S3 对象前缀路径。'),
+      s3PublicUrl: Schema.string().default('').description('S3 公网访问地址前缀，如 https://cdn.example.com/chatluna-images')
+    }).description('图床托管 · S3'),
+    Schema.object({
+      mode: Schema.const('image-bed-webdav').default('image-bed-webdav').description('图床托管 · WebDAV'),
+      webdavEndpoint: Schema.string().default('').description('WebDAV 根地址。'),
+      webdavUsername: Schema.string().default('').description('WebDAV 用户名。'),
+      webdavPassword: Schema.string().role('secret').default('').description('WebDAV 密码。'),
+      webdavBasePath: Schema.string().default('chatluna-images').description('WebDAV 目录。'),
+      webdavPublicUrl: Schema.string().default('').description('WebDAV 公网访问地址前缀。必填，否则搜索引擎无法访问。')
+    }).description('图床托管 · WebDAV')
+  ]).default({ mode: 'self-hosted', publicBaseUrl: '' }).description('公网访问'),
   features: Schema.object({
     toolEnabled: Schema.boolean().default(true).description('是否注册以文搜图工具。'),
     toolName: Schema.string().default('image_search_resolve').description('以文搜图工具名称。'),
     toolDescription: Schema.string().role('textarea').default('Searches for images, extracts real image candidates, downloads them with browser-like headers, stores them as Koishi-accessible URLs, and returns ready-to-send image links. Use this instead of sending remote hotlink URLs directly.').description('以文搜图工具描述。'),
     reverseEnabled: Schema.boolean().default(true).description('是否注册以图搜图工具。'),
     reverseToolName: Schema.string().default('image_reverse_search_resolve').description('以图搜图工具名称。'),
-    reverseDescription: Schema.string().role('textarea').default('Reverse-searches an image with automatic provider selection: Google Vision service-account OAuth for private/local images that require downloaded bytes, and SerpApi Google Lens for public QQ/Tencent CDN image URLs.').description('以图搜图工具描述。'),
-    qqMediaEnabled: Schema.boolean().default(true).description('是否注册 qq多媒体直链解析工具。'),
-    qqMediaToolName: Schema.string().default('qq_media_link_resolve').description('qq多媒体直链解析工具名称。'),
-    qqMediaDescription: Schema.string().role('textarea').default('Resolves recent QQ/OneBot media and file messages through one unified tool, including images, voice/audio, common text files, and attachments. It verifies the original URL, optionally stores the asset in the managed cache, and can include a bounded text preview for text files. Use imageIndex as a backward-compatible alias for image mediaIndex.').description('qq多媒体直链解析工具描述。')
+    reverseDescription: Schema.string().role('textarea').default('Reverse-searches an image using SerpApi Google Lens for public QQ/Tencent CDN image URLs. Requires a publicly accessible image URL.').description('以图搜图工具描述。'),
+    qqMediaEnabled: Schema.boolean().default(true).description('是否注册多媒体直链解析工具。'),
+    qqMediaToolName: Schema.string().default('qq_media_link_resolve').description('多媒体直链解析工具名称。'),
+    qqMediaDescription: Schema.string().role('textarea').default('Resolves recent QQ/OneBot media and file messages through one unified tool, including images, voice/audio, common text files, and attachments. It verifies the original URL, optionally stores the asset in the managed cache, and can include a bounded text preview for text files. Use imageIndex as a backward-compatible alias for image mediaIndex.').description('多媒体直链解析工具描述。')
   }).description('功能开关'),
   textSearch: Schema.object({
     provider: Schema.const('serpapi').default('serpapi').description('固定使用 SerpApi Google Images，直接返回原图候选。'),
@@ -161,57 +192,40 @@ export const Config: Schema<any> = Schema.object({
     minHeight: Schema.number().min(1).max(4000).default(220).description('候选图片最小高度。')
   }).description('以文搜图'),
   reverseSearch: Schema.object({
-    provider: Schema.union([
-      Schema.const('auto').description('自动：优先尝试最佳提供方，失败后自动切换到另一种。'),
-      Schema.const('serpapi-lens').description('SerpApi Google Lens：使用公网图片 URL，适合 QQ/NapCat CDN 链接。'),
-      Schema.const('google').description('Google Cloud Vision：下载图片转 base64 提交，支持私有/本地 URL。')
-    ]).default('auto').description('以图搜图提供方。'),
     serpApiGoogleDomain: Schema.string().default('google.com').description('SerpApi google_domain。'),
     maxResults: Schema.number().min(1).max(50).default(10).description('最大反搜结果数。'),
-    publicBaseUrl: Schema.string().default('').description('公网 Koishi 根地址；SerpApi 需要公网 URL 时用于改写 ChatLuna/本地缓存链接。'),
     customPrompt: Schema.string().role('textarea').default('').description('附加到以图搜图工具结果中的模型提示。')
   }).description('以图搜图'),
   qqMedia: Schema.object({
     maxTrackedMessages: Schema.number().min(10).max(1000).default(120).description('仅在内存中保留最近多少条含媒体/文件消息索引，不写入磁盘。'),
     cacheOnResolve: Schema.boolean().default(true).description('工具被调用时是否按需下载并写入统一缓存。'),
     textPreviewBytes: Schema.number().min(256).max(262144).default(32768).description('文本文件预览最大字节数。')
-  }).description('QQ 多媒体解析'),
+  }).description('媒体解析'),
   storage: Schema.object({
     ttlHours: Schema.number().min(1).max(24 * 365).default(24 * 7).description('所有受管缓存资源的统一保留时间，单位小时。'),
     localDirectory: Schema.string().default('data/chatluna-image-resolver').description('本地缓存目录，相对 Koishi baseDir。'),
     localPublicPath: Schema.string().default('/chatluna-image-resolver').description('本地缓存 HTTP 路径。'),
-    expiredRetentionMinutes: Schema.number().min(1).max(24 * 365 * 60).default(5).description('原始直链检测失效后，缓存资源继续保留多少分钟再清理。默认 5 分钟。'),
-    cleanupIntervalMinutes: Schema.number().min(1).max(24 * 30 * 60).default(5).description('统一缓存清理间隔分钟数。默认 5 分钟。'),
-    livenessCheckBatchSize: Schema.number().min(1).max(100).default(12).description('每轮自动巡检最多检查多少条原始直链。用于控制网络开销。'),
-    autoRevive: Schema.boolean().default(true).description('本地缓存文件丢失但原始直链仍存活时，自动重新下载并恢复缓存。'),
-    publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取资源的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景。'),
-    webdavEnabled: Schema.boolean().default(false).description('是否同步到 WebDAV。'),
-    webdavEndpoint: Schema.string().default('').description('WebDAV 根地址，例如 https://example.com/dav。'),
-    webdavUsername: Schema.string().default('').description('WebDAV 用户名。'),
-    webdavPassword: Schema.string().role('secret').default('').description('WebDAV 密码。'),
-    webdavBasePath: Schema.string().default('chatluna-images').description('WebDAV 目录。'),
-    webdavPublicBaseUrl: Schema.string().default('').description('WebDAV 公开访问根地址；留空则只同步，不返回公开 URL。')
-  }).description('存储与分发'),
+    cleanupIntervalMinutes: Schema.number().min(1).max(24 * 30 * 60).default(5).description('维护巡检间隔分钟数。每轮做两件事：① 探测一批资源的图床/缓存 URL 可达性，结果写入 DB 并驱动面板小绿点/红点；② 清理本地副本中超过保留时长的文件（self-hosted 模式按 ttlHours，image-bed 模式按 imageBedLocalBufferHours）。默认 5 分钟。'),
+    livenessCheckBatchSize: Schema.number().min(1).max(100).default(12).description('每轮可达性巡检最多探测多少条 URL。先发 HEAD，失败回落 GET Range: bytes=0-0 只拉 1 字节。用于控制网络开销。'),
+    imageBedLocalBufferHours: Schema.number().min(0).max(720).default(1).description('图床模式下，本地副本作为热缓冲保留多少小时；过期后自动 unlink 本地文件，R2/WebDAV 与数据库索引保持不变。设 0 表示上传成功立即删本地。'),
+    coldThresholdDays: Schema.number().min(0).max(3650).default(30).description('长期未访问资源的冷清阈值（天）。超过此天数未被访问的资源会自动同步删除：本地文件 + 图床对象 + 数据库索引三方一并清理。设 0 关闭自动冷清。'),
+    publicBaseUrl: Schema.string().default('').description('返回给聊天平台拉取资源的公开根地址；用于 NapCat/OneBot Docker 等无法访问 127.0.0.1 的场景。')
+  }).description('缓存管理'),
   http: Schema.object({
     userAgent: Schema.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36').description('下载资源和调用外部 API 时使用的 User-Agent。'),
     timeoutMs: Schema.number().min(3000).max(60000).default(12000).description('API 请求和下载超时。'),
     imageBytes: Schema.number().min(100000).max(20000000).default(8000000).description('图片下载最大字节数。'),
     mediaBytes: Schema.number().min(100000).max(50000000).default(12000000).description('非图片媒体/文件下载最大字节数。')
-  }).description('HTTP 请求'),
+  }).description('网络请求'),
   debugging: Schema.object({
-    useChatLunaProxy: Schema.boolean().default(true).description('启用后自动复用 ChatLuna 主插件的代理地址访问 Google Vision 等外部 API。'),
+    useChatLunaProxy: Schema.boolean().default(true).description('启用后复用 ChatLuna 主插件的代理地址访问外部网络。'),
     logging: Schema.boolean().default(false).description('调试日志')
-  }).description('调试')
+  }).description('调试日志')
 })
 
 const DEFAULT_CONFIG: Config = {
   credentials: {
-    serpApiKey: '',
-    googleClientEmail: '',
-    googlePrivateKey: '',
-    googleProjectId: '',
-    googleTokenUri: 'https://oauth2.googleapis.com/token',
-    googleApiKey: ''
+    serpApiKey: ''
   },
   tool: {
     enabled: true,
@@ -239,14 +253,11 @@ const DEFAULT_CONFIG: Config = {
   reverse: {
     enabled: true,
     toolName: 'image_reverse_search_resolve',
-    description: 'Reverse-searches an image with automatic provider selection: Google Vision service-account OAuth for private/local images that require downloaded bytes, and SerpApi Google Lens for public QQ/Tencent CDN image URLs.',
-    provider: 'auto',
+    description: 'Reverse-searches an image using SerpApi Google Lens for public QQ/Tencent CDN image URLs. Requires a publicly accessible image URL.',
+    provider: 'serpapi-lens',
     serpApiKey: '',
     serpApiGoogleDomain: 'google.com',
-    googleApiKey: '',
-    googleServiceAccountJson: '',
     maxResults: 10,
-    publicBaseUrl: '',
     customPrompt: ''
   },
   qqMedia: {
@@ -263,15 +274,31 @@ const DEFAULT_CONFIG: Config = {
     localDirectory: 'data/chatluna-image-resolver',
     localPublicPath: '/chatluna-image-resolver',
     retentionDays: 7,
-    expiredRetentionDays: 5 / 1440,
-    expiredRetentionMinutes: 5,
     cleanupIntervalMinutes: 5,
     livenessCheckBatchSize: 12,
     cleanupIntervalHours: 5 / 60,
-    autoRevive: true
+    imageBedLocalBufferHours: 1,
+    coldThresholdDays: 30
   },
   delivery: {
     publicBaseUrl: ''
+  },
+  publicAccess: {
+    mode: 'self-hosted' as const,
+    publicBaseUrl: '',
+    imageBedProvider: 's3' as const,
+    s3Endpoint: '',
+    s3Region: 'auto',
+    s3Bucket: '',
+    s3AccessKeyId: '',
+    s3SecretAccessKey: '',
+    s3PathPrefix: 'chatluna-images',
+    s3PublicUrl: '',
+    webdavEndpoint: '',
+    webdavUsername: '',
+    webdavPassword: '',
+    webdavBasePath: 'chatluna-images',
+    webdavPublicUrl: ''
   },
   network: {
     useChatLunaProxy: true
@@ -303,32 +330,6 @@ function daysFromHours(hours: number | undefined, fallbackDays: number) {
 function daysFromMinutes(minutes: number | undefined, fallbackDays: number) {
   if (!Number.isFinite(Number(minutes))) return fallbackDays
   return Math.max(1 / 1440, Number(minutes) / 1440)
-}
-
-function parseServiceAccountJson(raw: unknown) {
-  if (typeof raw !== 'string' || !raw.trim()) return {}
-  try {
-    const parsed = JSON.parse(raw)
-    return {
-      clientEmail: typeof parsed?.client_email === 'string' ? parsed.client_email : undefined,
-      privateKey: typeof parsed?.private_key === 'string' ? parsed.private_key : undefined,
-      projectId: typeof parsed?.project_id === 'string' ? parsed.project_id : undefined,
-      tokenUri: typeof parsed?.token_uri === 'string' ? parsed.token_uri : undefined
-    }
-  } catch {
-    return {}
-  }
-}
-
-function buildServiceAccountJson(credentials: Config['credentials']) {
-  if (!credentials.googleClientEmail.trim() || !credentials.googlePrivateKey.trim()) return ''
-  return JSON.stringify({
-    type: 'service_account',
-    project_id: credentials.googleProjectId.trim() || undefined,
-    client_email: credentials.googleClientEmail.trim(),
-    private_key: credentials.googlePrivateKey,
-    token_uri: credentials.googleTokenUri.trim() || DEFAULT_CONFIG.credentials.googleTokenUri
-  })
 }
 
 export function normalizeConfig(input: any = {}): Config {
@@ -373,18 +374,9 @@ export function normalizeConfig(input: any = {}): Config {
     minHeight: nested.textSearch.minHeight
   })
   const flatReverseProvider = compact({
-    provider: typeof nested.reverseSearch.provider === 'string' ? nested.reverseSearch.provider : undefined,
     serpApiKey: nested.reverseSearch.serpApiKey,
-    serpApiGoogleDomain: nested.reverseSearch.serpApiGoogleDomain,
-    googleApiKey: nested.reverseSearch.googleApiKey,
-    googleServiceAccountJson: nested.reverseSearch.googleServiceAccountJson
+    serpApiGoogleDomain: nested.reverseSearch.serpApiGoogleDomain
   })
-  const parsedGoogleServiceAccount = parseServiceAccountJson(
-    nested.credentials.googleServiceAccountJson
-      || nested.reverseSearch.googleServiceAccountJson
-      || (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.googleServiceAccountJson : '')
-      || legacy.reverse?.googleServiceAccountJson
-  )
   const credentials = merge(DEFAULT_CONFIG.credentials, compact({
     serpApiKey: nested.credentials.serpApiKey
       ?? nested.textSearch.serpApiKey
@@ -392,23 +384,10 @@ export function normalizeConfig(input: any = {}): Config {
       ?? nested.reverseSearch.serpApiKey
       ?? (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.serpApiKey : undefined)
       ?? legacy.search?.serpApiKey
-      ?? legacy.reverse?.serpApiKey,
-    googleClientEmail: nested.credentials.googleClientEmail
-      ?? parsedGoogleServiceAccount.clientEmail,
-    googlePrivateKey: nested.credentials.googlePrivateKey
-      ?? parsedGoogleServiceAccount.privateKey,
-    googleProjectId: nested.credentials.googleProjectId
-      ?? parsedGoogleServiceAccount.projectId,
-    googleTokenUri: nested.credentials.googleTokenUri
-      ?? parsedGoogleServiceAccount.tokenUri,
-    googleApiKey: nested.credentials.googleApiKey
-      ?? nested.reverseSearch.googleApiKey
-      ?? (typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider.googleApiKey : undefined)
-      ?? legacy.reverse?.googleApiKey
+      ?? legacy.reverse?.serpApiKey
   }))
   const flatReverseBehavior = compact({
     maxResults: nested.reverseSearch.maxResults,
-    publicBaseUrl: nested.reverseSearch.publicBaseUrl,
     customPrompt: nested.reverseSearch.customPrompt
   })
   const flatMediaTracking = compact({
@@ -425,8 +404,6 @@ export function normalizeConfig(input: any = {}): Config {
       localFallback: nested.storage.localFallback,
       localDirectory: nested.storage.localDirectory,
       localPublicPath: nested.storage.localPublicPath,
-      expiredRetentionMinutes: nested.storage.expiredRetentionMinutes,
-      expiredRetentionHours: nested.storage.expiredRetentionHours,
       cleanupIntervalMinutes: nested.storage.cleanupIntervalMinutes,
       livenessCheckBatchSize: nested.storage.livenessCheckBatchSize,
       cleanupIntervalHours: nested.storage.cleanupIntervalHours
@@ -463,18 +440,6 @@ export function normalizeConfig(input: any = {}): Config {
     })
   }
   const ttlHours = Number(storageCache.ttlHours ?? legacy.image?.tempExpireHours ?? DEFAULT_CONFIG.image.tempExpireHours)
-  const legacyExpiredHours = Number.isFinite(Number(legacy.storage?.expiredRetentionDays))
-    ? Number(legacy.storage.expiredRetentionDays) * 24
-    : undefined
-  const legacyExpiredMinutes = Number.isFinite(Number(legacy.storage?.expiredRetentionMinutes))
-    ? Number(legacy.storage.expiredRetentionMinutes)
-    : Number.isFinite(Number(legacyExpiredHours))
-      ? Number(legacyExpiredHours) * 60
-      : undefined
-  const expiredMinutes = Number(storageCache.expiredRetentionMinutes
-    ?? (Number.isFinite(Number(storageCache.expiredRetentionHours)) ? Number(storageCache.expiredRetentionHours) * 60 : undefined)
-    ?? legacyExpiredMinutes
-    ?? DEFAULT_CONFIG.storage.expiredRetentionMinutes)
   const cleanupIntervalMinutes = Number(storageCache.cleanupIntervalMinutes
     ?? (Number.isFinite(Number(storageCache.cleanupIntervalHours)) ? Number(storageCache.cleanupIntervalHours) * 60 : undefined)
     ?? legacy.storage?.cleanupIntervalMinutes
@@ -499,11 +464,13 @@ export function normalizeConfig(input: any = {}): Config {
     reverse: {
       ...merge(DEFAULT_CONFIG.reverse, legacy.reverse),
       ...merge({}, nested.features.reverse || flatFeatureReverse),
-      ...merge({}, typeof nested.reverseSearch.provider === 'object' ? nested.reverseSearch.provider : flatReverseProvider),
+      ...merge({}, typeof nested.reverseSearch.provider === 'object' ? compact({
+        serpApiKey: nested.reverseSearch.provider.serpApiKey,
+        serpApiGoogleDomain: nested.reverseSearch.provider.serpApiGoogleDomain
+      }) : flatReverseProvider),
       ...merge({}, nested.reverseSearch.behavior || flatReverseBehavior),
-      serpApiKey: credentials.serpApiKey,
-      googleApiKey: credentials.googleApiKey,
-      googleServiceAccountJson: buildServiceAccountJson(credentials)
+      provider: 'serpapi-lens',
+      serpApiKey: credentials.serpApiKey
     },
     qqMedia: {
       ...merge(DEFAULT_CONFIG.qqMedia, legacy.qqMedia),
@@ -518,30 +485,63 @@ export function normalizeConfig(input: any = {}): Config {
       localDirectory: storageCache.localDirectory ?? legacy.storage?.localDirectory ?? DEFAULT_CONFIG.storage.localDirectory,
       localPublicPath: storageCache.localPublicPath ?? legacy.storage?.localPublicPath ?? DEFAULT_CONFIG.storage.localPublicPath,
       retentionDays: daysFromHours(ttlHours, legacy.storage?.retentionDays ?? DEFAULT_CONFIG.storage.retentionDays),
-      expiredRetentionDays: daysFromMinutes(expiredMinutes, legacy.storage?.expiredRetentionDays ?? DEFAULT_CONFIG.storage.expiredRetentionDays),
-      expiredRetentionMinutes: Math.max(1, expiredMinutes),
       cleanupIntervalMinutes: Math.max(1, cleanupIntervalMinutes),
       livenessCheckBatchSize: Number(storageCache.livenessCheckBatchSize ?? legacy.storage?.livenessCheckBatchSize ?? DEFAULT_CONFIG.storage.livenessCheckBatchSize),
       cleanupIntervalHours: Math.max(1 / 60, cleanupIntervalMinutes / 60),
-      autoRevive: storageCache.autoRevive ?? legacy.storage?.autoRevive ?? DEFAULT_CONFIG.storage.autoRevive
+      imageBedLocalBufferHours: Number(storageCache.imageBedLocalBufferHours ?? legacy.storage?.imageBedLocalBufferHours ?? DEFAULT_CONFIG.storage.imageBedLocalBufferHours),
+      coldThresholdDays: Number(storageCache.coldThresholdDays ?? legacy.storage?.coldThresholdDays ?? DEFAULT_CONFIG.storage.coldThresholdDays)
     },
     delivery: merge(DEFAULT_CONFIG.delivery, legacy.delivery || storageDelivery),
+    publicAccess: (() => {
+      const inputPublicAccess = legacy.publicAccess || {}
+      const base = merge(DEFAULT_CONFIG.publicAccess, inputPublicAccess)
+      // Map flat schema mode values to internal representation
+      const mode = base.mode as string
+      if (mode === 'image-bed-s3') {
+        base.mode = 'image-bed' as any
+        base.imageBedProvider = 's3' as any
+      } else if (mode === 'image-bed-webdav') {
+        base.mode = 'image-bed' as any
+        base.imageBedProvider = 'webdav' as any
+      }
+      // Legacy storage.webdav migration
+      if (storageWebdav.enabled && storageWebdav.endpoint && !inputPublicAccess.mode) {
+        return {
+          ...base,
+          mode: 'image-bed' as const,
+          imageBedProvider: 'webdav' as const,
+          webdavEndpoint: storageWebdav.endpoint || base.webdavEndpoint,
+          webdavUsername: storageWebdav.username || base.webdavUsername,
+          webdavPassword: storageWebdav.password || base.webdavPassword,
+          webdavBasePath: storageWebdav.basePath || base.webdavBasePath,
+          webdavPublicUrl: storageWebdav.publicBaseUrl || base.webdavPublicUrl,
+        }
+      }
+      return base
+    })(),
     network: merge(DEFAULT_CONFIG.network, legacy.network || debuggingNetwork),
-    webdav: merge(DEFAULT_CONFIG.webdav, legacy.webdav || storageWebdav),
+    webdav: {
+      ...merge(DEFAULT_CONFIG.webdav, legacy.webdav || storageWebdav),
+      enabled: false,
+    },
     debug: Boolean(legacy.debug ?? nested.debugging.logging ?? DEFAULT_CONFIG.debug)
   }
 }
 
 export const usage = `
 <p><strong>Miyako ChatLuna 媒体解析器</strong></p>
-<p>为 ChatLuna 提供以文搜图、以图搜图、QQ 图片/语音/文件直链解析，以及本地缓存托管。多数配置保持默认即可，通常只需要先填写 API 凭据。</p>
+<p>为 ChatLuna 提供以文搜图、以图搜图（SerpApi Google Lens）、QQ 图片/语音/文件直链解析，以及本地缓存托管。多数配置保持默认即可，通常只需要先填写 SerpApi API Key。</p>
 <ul>
 <li>SerpApi Key 只在「API 凭据」里填一次，以文搜图和以图搜图共用</li>
-<li>Google Vision 只需服务账号的 <code>client_email</code> 与 <code>private_key</code></li>
+<li>以图搜图需要公网可访问的图片 URL；如果图片存在本地缓存，请配置「公网根地址」以改写为公网链接</li>
 <li>其余搜索、缓存、HTTP 参数默认适合常规使用</li>
 </ul>
 <p>注册工具：<code>image_search_resolve</code>（以文搜图）、<code>image_reverse_search_resolve</code>（以图搜图）、<code>qq_media_link_resolve</code>（QQ 多媒体直链解析）。本地缓存默认保留 7 天，启用 console 后可在侧栏「媒体缓存」页面管理资源。</p>
 `
+
+export function resolveCacheOnResolve(inputCache: boolean | undefined, defaultCacheOnResolve: boolean) {
+  return inputCache ?? defaultCacheOnResolve
+}
 
 declare module 'koishi' {
   interface Context {
@@ -553,6 +553,10 @@ declare module 'koishi' {
     }
     console?: {
       addEntry: (entry: { dev: string; prod: string }) => void
+    }
+    database?: any
+    model?: {
+      extend: (name: string, fields: Record<string, string>, options?: Record<string, unknown>) => void
     }
   }
 }
@@ -602,7 +606,7 @@ class ReverseImageResolverTool extends StructuredTool {
   async _call(input: z.infer<typeof REVERSE_TOOL_SCHEMA>) {
     const session = this.tracker.getSessionContext()
     const resolver = new ReverseImageResolver(this.ctx, this.config, session)
-    const result = await resolver.resolve(input.imageUrl, input.provider, input.maxResults)
+    const result = await resolver.resolve(input.imageUrl, input.maxResults)
     return JSON.stringify(result, null, 2)
   }
 }
@@ -633,91 +637,108 @@ class QQMediaLinkResolverTool extends StructuredTool {
 
     const candidates = kind ? found.record.media.filter((item) => item.kind === kind) : found.record.media
     const mediaIndexInput = input.mediaIndex ?? input.imageIndex
-    const mediaIndex = clamp(mediaIndexInput ?? candidates.length - 1, 0, candidates.length - 1)
-    const media = candidates[mediaIndex]
-    const originalUrl = media.src
-    const alive = await checkRemoteImageAlive(originalUrl, this.config)
-    const publicUrl = isPublicHttpUrl(originalUrl)
-    const shouldCache = input.cache ?? true
+    const shouldReturnAll = input.all ?? typeof mediaIndexInput !== 'number'
+    const selectedIndex = clamp(mediaIndexInput ?? candidates.length - 1, 0, candidates.length - 1)
+    const selectedCandidates = shouldReturnAll
+      ? candidates.map((media, index) => ({ media, mediaIndex: index }))
+      : [{ media: candidates[selectedIndex], mediaIndex: selectedIndex }]
+    const shouldCache = resolveCacheOnResolve(input.cache, this.config.qqMedia.cacheOnResolve)
     const target = input.target ?? 'auto'
-    let cachedUrl: string | undefined
-    let cacheError: string | undefined
-    let textPreview: string | undefined
-    let textTruncated: boolean | undefined
-    let bytes = media.fileSize || 0
-    let mime = media.mime || alive.contentType || mimeFromFilename(media.fileName || media.file || '')
+    const items = []
 
-    if (shouldCache || (media.kind === 'text' && (input.readText ?? true))) {
-      try {
-        const downloaded = await downloadMediaFromUrl(originalUrl, this.config, {
-          kind: media.kind,
-          filenameHint: media.fileName || media.file,
-          mimeHint: media.mime,
-          referer: 'https://multimedia.nt.qq.com.cn/'
-        })
-        bytes = downloaded.buffer.length
-        mime = downloaded.mime
-        if (shouldCache) {
-          cachedUrl = await storeManagedAsset(this.ctx, this.config, downloaded.buffer, downloaded.filename, downloaded.mime, {
+    for (const { media, mediaIndex } of selectedCandidates) {
+      const originalUrl = media.src
+      const alive = await checkRemoteImageAlive(originalUrl, this.config)
+      const originalUrlPublic = isPublicHttpUrl(originalUrl)
+      let cachedUrl: string | undefined
+      let imageBedUrl: string | undefined
+      let cacheError: string | undefined
+      let textPreview: string | undefined
+      let textTruncated: boolean | undefined
+      let bytes = media.fileSize || 0
+      let mime = media.mime || alive.contentType || mimeFromFilename(media.fileName || media.file || '')
+
+      if (shouldCache || (media.kind === 'text' && (input.readText ?? true))) {
+        try {
+          const downloaded = await downloadMediaFromUrl(originalUrl, this.config, {
             kind: media.kind,
-            originalUrl,
-            sourcePage: `onebot-message:${found.record.messageId}`,
-            messageId: found.record.messageId,
-            channelId: found.record.channelId,
-            guildId: found.record.guildId,
-            userId: found.record.userId,
-            mediaIndex,
-            file: media.file,
-            fileName: media.fileName,
-            fileSize: media.fileSize,
-            duration: media.duration
+            filenameHint: media.fileName || media.file,
+            mimeHint: media.mime,
+            referer: 'https://multimedia.nt.qq.com.cn/'
           })
+          bytes = downloaded.buffer.length
+          mime = downloaded.mime
+          if (shouldCache) {
+            const stored = await storeManagedAsset(this.ctx, this.config, downloaded.buffer, downloaded.filename, downloaded.mime, {
+              kind: media.kind,
+              originalUrl,
+              sourcePage: `onebot-message:${found.record.messageId}`,
+              messageId: found.record.messageId,
+              channelId: found.record.channelId,
+              guildId: found.record.guildId,
+              userId: found.record.userId,
+              platform: found.record.platform,
+              mediaIndex,
+              file: media.file,
+              fileName: media.fileName,
+              fileSize: media.fileSize,
+              duration: media.duration,
+              isAnimated: downloaded.mime === 'image/gif'
+            })
+            cachedUrl = stored.cachedUrl
+            imageBedUrl = stored.imageBedUrl
+          }
+          if (media.kind === 'text' && (input.readText ?? true)) {
+            const maxBytes = clamp(input.maxTextBytes ?? this.config.qqMedia.textPreviewBytes, 256, 262144)
+            textPreview = downloaded.buffer.subarray(0, maxBytes).toString('utf8')
+            textTruncated = downloaded.buffer.length > maxBytes
+          }
+        } catch (error) {
+          cacheError = formatError(error)
         }
-        if (media.kind === 'text' && (input.readText ?? true)) {
-          const maxBytes = clamp(input.maxTextBytes ?? this.config.qqMedia.textPreviewBytes, 256, 262144)
-          textPreview = downloaded.buffer.subarray(0, maxBytes).toString('utf8')
-          textTruncated = downloaded.buffer.length > maxBytes
-        }
-      } catch (error) {
-        cacheError = formatError(error)
       }
+
+      items.push({
+        mediaIndex,
+        imageIndex: media.kind === 'image' ? mediaIndex : undefined,
+        kind: media.kind,
+        originalUrl,
+        cachedUrl,
+        imageBedUrl,
+        primaryUrl: cachedUrl,
+        originalUrlPublic,
+        originalUrlAlive: alive,
+        cached: Boolean(cachedUrl),
+        cacheError,
+        filename: media.fileName || media.file,
+        bytes: bytes || undefined,
+        mime,
+        duration: media.duration,
+        textPreview,
+        textTruncated
+      })
     }
+
+    const selected = items.find((item) => item.mediaIndex === selectedIndex) || items[0]
 
     return JSON.stringify({
       ok: true,
       target,
       messageId: found.record.messageId,
-      mediaIndex,
-      imageIndex: media.kind === 'image' ? mediaIndex : undefined,
-      kind: media.kind,
-      originalUrl,
-      cachedUrl,
-      primaryUrl: cachedUrl,
-      originalUrlPublic: publicUrl,
-      originalUrlAlive: alive,
-      cached: Boolean(cachedUrl),
-      cacheError,
-      filename: media.fileName || media.file,
-      bytes: bytes || undefined,
-      mime,
-      duration: media.duration,
-      textPreview,
-      textTruncated,
-      recommendations: media.kind === 'image' ? {
-        reverseSearch: cachedUrl
-          ? 'Use cachedUrl with image_reverse_search_resolve provider=auto first. Only fall back to originalUrl if caching failed and the user explicitly needs reverse search.'
+      ...selected,
+      items,
+      recommendations: selected?.kind === 'image' ? {
+        reverseSearch: selected.cachedUrl
+          ? 'Use cachedUrl with image_reverse_search_resolve first. Only fall back to originalUrl if caching failed and the user explicitly needs reverse search.'
           : 'Call this tool again with cache=true or explain that the media could not be cached before using originalUrl.',
-        googleVision: cachedUrl
-          ? 'Use cachedUrl for Google Vision because Koishi can fetch cached/local image bytes reliably.'
-          : 'No cached URL is available; avoid direct downstream media processing unless the user accepts original CDN instability.',
-        chatluna: cachedUrl
+        chatluna: selected.cachedUrl
           ? 'Use cachedUrl for local delivery and later cache inspection.'
           : 'Do not treat originalUrl as the preferred processing URL; it is only diagnostic/fallback information.'
       } : undefined,
-      note: media.kind === 'text'
+      note: selected?.kind === 'text'
         ? 'Text previews are bounded; use cachedUrl/originalUrl when the full file is needed.'
-        : media.kind === 'image'
-          ? 'This unified media tool replaces the old dedicated QQ image link tool. QQ/NapCat media URLs often reject HEAD but allow ranged/full GET.'
+        : selected?.kind === 'image'
+          ? 'QQ/NapCat media URLs often reject HEAD but allow ranged/full GET.'
           : 'Media is cached only when this tool is called, so ordinary group traffic does not fill disk.'
     }, null, 2)
   }
@@ -741,13 +762,15 @@ class QQMediaCacheLookupTool extends StructuredTool {
       const byOriginal = byCached ? undefined : await findManagedCacheByOriginalUrl(directory, url).catch(() => undefined)
       const exact = byCached || byOriginal
       if (exact) {
+        const exactCachedUrl = await resolveLiveCachedUrl(directory, exact as any)
         return JSON.stringify({
           ok: true,
           mode: 'url',
           items: [{
-            cachedUrl: exact.url,
+            cachedUrl: exactCachedUrl,
+            imageBedUrl: (exact as any).imageBedUrl || undefined,
             originalUrl: exact.originalUrl,
-            primaryUrl: exact.url,
+            primaryUrl: exactCachedUrl,
             cached: true,
             manifest: exact.manifest,
             filename: exact.filename,
@@ -767,13 +790,13 @@ class QQMediaCacheLookupTool extends StructuredTool {
       }
       const fuzzy = await searchManagedCache(directory, url, input.limit ?? 5).catch(() => [])
       if (fuzzy.length > 0) {
-        return JSON.stringify({
-          ok: true,
-          mode: 'url-fuzzy',
-          items: fuzzy.map((item) => ({
-            cachedUrl: item.url,
+        const fuzzyItems = await Promise.all(fuzzy.map(async (item) => {
+          const cu = await resolveLiveCachedUrl(directory, item as any)
+          return {
+            cachedUrl: cu,
+            imageBedUrl: (item as any).imageBedUrl || undefined,
             originalUrl: item.originalUrl,
-            primaryUrl: item.url,
+            primaryUrl: cu,
             cached: true,
             manifest: item.manifest,
             filename: item.filename,
@@ -787,7 +810,12 @@ class QQMediaCacheLookupTool extends StructuredTool {
             guildId: item.guildId,
             platform: item.platform,
             createdAt: item.createdAt
-          })),
+          }
+        }))
+        return JSON.stringify({
+          ok: true,
+          mode: 'url-fuzzy',
+          items: fuzzyItems,
           hint: 'No exact URL match. Showing partial matches. Use originalUrl for attribution/source.'
         }, null, 2)
       }
@@ -803,18 +831,17 @@ class QQMediaCacheLookupTool extends StructuredTool {
       const limit = input.limit ?? 10
       const { items: allItems } = await listManagedImageCache(directory)
       const filtered = allItems
-        .filter((item) => !item.originalUrlExpired)
         .filter((item) => !input.kind || detectManagedAssetKind(item.filename || '', item.mime || '') === input.kind)
         .filter((item) => !input.userId || item.userId === input.userId)
         .sort((a, b) => String(b.createdAt || b.mtime || '').localeCompare(String(a.createdAt || a.mtime || '')))
         .slice(0, limit)
-      return JSON.stringify({
-        ok: filtered.length > 0,
-        mode: input.recent ? 'recent' : 'listCache',
-        items: filtered.map((item) => ({
-          cachedUrl: item.url,
+      const filteredItems = await Promise.all(filtered.map(async (item) => {
+        const cu = await resolveLiveCachedUrl(directory, item as any)
+        return {
+          cachedUrl: cu,
+          imageBedUrl: (item as any).imageBedUrl || undefined,
           originalUrl: item.originalUrl,
-          primaryUrl: item.url,
+          primaryUrl: cu,
           cached: true,
           manifest: item.manifest,
           filename: item.filename,
@@ -828,7 +855,12 @@ class QQMediaCacheLookupTool extends StructuredTool {
           guildId: item.guildId,
           platform: item.platform,
           createdAt: item.createdAt
-        })),
+        }
+      }))
+      return JSON.stringify({
+        ok: filtered.length > 0,
+        mode: input.recent ? 'recent' : 'listCache',
+        items: filteredItems,
         hint: filtered.length > 0
           ? `Showing ${filtered.length} cached items${input.userId ? ` for user ${input.userId}` : ''}. Use cachedUrl for delivery. originalUrl may be expired but is kept for attribution.`
           : input.userId
@@ -852,6 +884,7 @@ class QQMediaCacheLookupTool extends StructuredTool {
       const selected = typeof selectedIndex === 'number' ? candidates.slice(selectedIndex, selectedIndex + 1) : candidates
       for (const media of selected) {
         const cached = await findManagedCacheByOriginalUrl(directory, media.src).catch(() => undefined)
+        const cachedUrlLive = cached ? await resolveLiveCachedUrl(directory, cached as any) : undefined
         items.push({
           messageId: record.messageId,
           channelId: record.channelId,
@@ -859,9 +892,10 @@ class QQMediaCacheLookupTool extends StructuredTool {
           userId: record.userId,
           kind: media.kind,
           originalUrl: media.src,
-          cachedUrl: cached?.url,
-          primaryUrl: cached?.url,
-          cached: Boolean(cached?.url),
+          cachedUrl: cachedUrlLive,
+          imageBedUrl: (cached as any)?.imageBedUrl || undefined,
+          primaryUrl: cachedUrlLive,
+          cached: Boolean(cachedUrlLive),
           manifest: cached?.manifest,
           filename: media.fileName || media.file,
           mime: media.mime,
@@ -884,10 +918,49 @@ class QQMediaCacheLookupTool extends StructuredTool {
   }
 }
 
+/**
+ * Persist a public-URL probe result into miyako_media_public_check by
+ * resolving the asset row from the manifest name. Used by the manual
+ * "批量检测" path so its dots survive a page refresh — the periodic sweep
+ * already records results, but the user-initiated check went through a
+ * disk-only path until now.
+ */
+async function persistCheckResultByManifest(
+  ctx: Context,
+  manifest: string,
+  publicUrl: string,
+  result: { ok: boolean; status: number; contentType?: string; contentLength?: string; error?: string }
+): Promise<void> {
+  const database = (ctx as any).database
+  if (!database) return
+  const filename = manifest.replace(/\.json$/, '')
+  if (!filename) return
+  try {
+    const rows = await database.get('miyako_media_asset', { filename })
+    const asset = rows?.[0]
+    if (!asset?.id) return
+    await recordPublicCheck(ctx, asset.id, { publicUrl, ...result })
+  } catch (error) {
+    ctx.logger(name).warn('persistCheckResultByManifest failed: %s', formatError(error))
+  }
+}
+
 export function apply(ctx: Context, input: ConfigInput | Config) {
   const config = normalizeConfig(input)
 
   configureProxyFromChatLuna(ctx, config)
+
+  // Load per-kind cache toggles from the on-disk settings file. Defaults to
+  // everything-on; the panel persists changes via /_cache/settings.
+  void loadCacheKinds(join(ctx.baseDir, config.storage.localDirectory))
+    .catch((error) => ctx.logger(name).warn('failed to load cache kinds: %s', formatError(error)))
+
+  ctx.inject(['database'], (ctx2) => {
+    registerCacheModels(ctx2)
+    const directory = join(ctx2.baseDir, config.storage.localDirectory)
+    void migrateManifestDirectory(ctx2, directory)
+      .catch((error) => ctx2.logger(name).warn('media cache manifest migration failed: %s', formatError(error)))
+  })
 
   ctx.console?.addEntry({
     dev: resolve(__dirname, '../client/index.ts'),
@@ -904,48 +977,115 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
   {
     const runCacheMaintenance = async () => {
       const directory = join(ctx.baseDir, config.storage.localDirectory)
-      await sweepManagedCacheOriginalUrls(directory, config, {
+      await sweepManagedCachePublicUrls(ctx as any, directory, config, {
         maxChecks: config.storage.livenessCheckBatchSize,
-        minCheckIntervalMinutes: config.storage.cleanupIntervalMinutes,
-        async onRevive(item, downloaded) {
-          await mkdir(directory, { recursive: true })
-          await writeFile(join(directory, item.filename), downloaded.buffer)
-          const base = trimTrailingSlash(ctx.server?.selfUrl ?? '')
-          const localUrl = `${base}${config.storage.localPublicPath}/${item.filename}`
-          const publicUrl = rewriteUrlBase(localUrl, config.delivery.publicBaseUrl)
-          await writeManagedAssetManifest(ctx, config, item.filename, publicUrl, downloaded.mime, downloaded.buffer.length, {
-            storage: 'local',
-            kind: item.kind,
-            originalUrl: item.originalUrl,
-            sourcePage: item.sourcePage,
-            userId: item.userId,
-            channelId: item.channelId,
-            guildId: item.guildId,
-            platform: item.platform
-          })
-          ctx.logger(name).info('revived cache (local): %s -> %s', item.filename, publicUrl)
-        }
+        minCheckIntervalMinutes: config.storage.cleanupIntervalMinutes
       })
-      await cleanupManagedImageCache(directory, {
+      await cleanupManagedImageCache(ctx, directory, {
         retentionDays: config.storage.retentionDays,
-        expiredRetentionDays: config.storage.expiredRetentionDays,
-        expiredRetentionMinutes: config.storage.expiredRetentionMinutes
+        config
       })
     }
 
     ctx.inject(['server'], (ctx2) => {
       if (!ctx2.server) return
       ctx2.server.get(`${config.storage.localPublicPath}/_cache`, async (koa) => {
+        const page = Number(koa.query?.page ?? 1)
+        const pageSize = Number(koa.query?.pageSize ?? koa.query?.limit ?? 50)
+        const query = String(koa.query?.q ?? '').trim()
+        const kind = String(koa.query?.kind ?? '').trim()
+        if ((ctx as any).database) {
+          // The panel collapses "text" into the "file" bucket; honor that here
+          // so `kind=file` filter returns both backend kinds.
+          const filters = kind && kind !== 'all'
+            ? (kind === 'file' ? { kind: ['file', 'text'] as any } : { kind })
+            : {}
+          const result = await searchAssets(ctx, query, filters, { page, pageSize })
+          // Global stats over the ENTIRE asset table (ignoring the active kind
+          // filter) so the stats bar and chip counts stay stable when the user
+          // toggles filters. The list itself respects the filter for pagination.
+          let globalStats: any = null
+          try {
+            const all: any[] = await (ctx as any).database.get('miyako_media_asset', {})
+            const byKind: Record<string, number> = { image: 0, audio: 0, text: 0, file: 0 }
+            let totalBytes = 0
+            let latestMs = 0
+            for (const row of all) {
+              const k = (row.kind || 'file')
+              byKind[k] = (byKind[k] || 0) + 1
+              totalBytes += Number(row.bytes || 0)
+              const t = new Date(row.createdAt || 0).getTime()
+              if (t > latestMs) latestMs = t
+            }
+            globalStats = {
+              totalItems: all.length,
+              totalBytes,
+              latestMtime: latestMs ? new Date(latestMs).toISOString() : null,
+              byKind
+            }
+          } catch {}
+          // Attach the latest public-check row per asset so the panel can render
+          // the alive-dot without forcing the user to click "批量检测" again.
+          const lastChecksByAsset: Record<string, any> = {}
+          if (result.items.length) {
+            const assetIds = result.items.map((it: any) => it.id).filter(Boolean)
+            if (assetIds.length) {
+              try {
+                const checks = await (ctx as any).database.get('miyako_media_public_check', { assetId: assetIds })
+                for (const check of checks as any[]) {
+                  const old = lastChecksByAsset[check.assetId]
+                  if (!old || new Date(check.checkedAt).getTime() > new Date(old.checkedAt).getTime()) {
+                    lastChecksByAsset[check.assetId] = check
+                  }
+                }
+              } catch {}
+            }
+          }
+          koa.set('Content-Type', 'application/json; charset=utf-8')
+          koa.body = JSON.stringify({
+            ...result,
+            globalStats,
+            items: result.items.map((item: any) => ({
+              ...item,
+              manifest: item.filename ? `${item.filename}.json` : undefined,
+              url: item.url || item.publicUrl,
+              lastCheck: lastChecksByAsset[item.id] ? {
+                ok: Boolean(lastChecksByAsset[item.id].ok),
+                status: Number(lastChecksByAsset[item.id].status || 0),
+                checkedAt: lastChecksByAsset[item.id].checkedAt
+              } : null
+            }))
+          })
+          return
+        }
+        const legacy = await listManagedImageCache(join(ctx.baseDir, config.storage.localDirectory))
+        const normalizedPage = Math.max(1, Math.floor(Number.isFinite(page) ? page : 1))
+        const normalizedPageSize = Math.min(100, Math.max(1, Math.floor(Number.isFinite(pageSize) ? pageSize : 50)))
+        const filtered = legacy.items.filter((item: any) => {
+          if (kind && kind !== 'all' && detectManagedAssetKind(item.filename || '', item.mime || '') !== kind) return false
+          if (!query) return true
+          return `${item.filename || ''} ${item.url || ''} ${item.originalUrl || ''} ${item.mime || ''}`.toLowerCase().includes(query.toLowerCase())
+        })
+        const start = (normalizedPage - 1) * normalizedPageSize
         koa.set('Content-Type', 'application/json; charset=utf-8')
-        koa.body = JSON.stringify(await listManagedImageCache(join(ctx.baseDir, config.storage.localDirectory)))
+        koa.body = JSON.stringify({
+          items: filtered.slice(start, start + normalizedPageSize),
+          page: normalizedPage,
+          pageSize: normalizedPageSize,
+          total: filtered.length,
+          hasNext: start + normalizedPageSize < filtered.length
+        })
       })
       ctx2.server.get(`${config.storage.localPublicPath}/_cache/check`, async (koa) => {
         const url = String(koa.query?.url ?? '').trim()
         const manifest = String(koa.query?.manifest ?? '').trim()
-        const result = await checkRemoteImageAlive(url, config)
-        if (manifest && result.ok === false) {
-          await markManagedCacheEntryExpired(join(ctx.baseDir, config.storage.localDirectory), manifest, result)
-            .catch((error) => ctx.logger(name).warn('mark expired media cache failed: %s', formatError(error)))
+        const result = await checkPublicUrl(url, config)
+        if (manifest) {
+          await updateManagedCacheEntry(join(ctx.baseDir, config.storage.localDirectory), manifest, {
+            publicUrlLastCheck: { ...result, checkedAt: new Date().toISOString() }
+          }).catch((error) => ctx.logger(name).warn('record public url check failed: %s', formatError(error)))
+          // Also persist into the DB so the dot survives a page refresh.
+          await persistCheckResultByManifest(ctx, manifest, url, result).catch(() => undefined)
         }
         koa.set('Content-Type', 'application/json; charset=utf-8')
         koa.body = JSON.stringify(result)
@@ -954,10 +1094,12 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
         const body = await readJsonBody(koa)
         const url = String(body?.url ?? '').trim()
         const manifest = String(body?.manifest ?? '').trim()
-        const result = await checkRemoteImageAlive(url, config)
-        if (manifest && result.ok === false) {
-          await markManagedCacheEntryExpired(join(ctx.baseDir, config.storage.localDirectory), manifest, result)
-            .catch((error) => ctx.logger(name).warn('mark expired media cache failed: %s', formatError(error)))
+        const result = await checkPublicUrl(url, config)
+        if (manifest) {
+          await updateManagedCacheEntry(join(ctx.baseDir, config.storage.localDirectory), manifest, {
+            publicUrlLastCheck: { ...result, checkedAt: new Date().toISOString() }
+          }).catch((error) => ctx.logger(name).warn('record public url check failed: %s', formatError(error)))
+          await persistCheckResultByManifest(ctx, manifest, url, result).catch(() => undefined)
         }
         koa.set('Content-Type', 'application/json; charset=utf-8')
         koa.body = JSON.stringify(result)
@@ -966,27 +1108,94 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
         const body = await readJsonBody(koa)
         const manifests = Array.isArray(body?.manifests) ? body.manifests.filter((m: unknown) => typeof m === 'string' && /^[a-zA-Z0-9._-]+\.json$/.test(m as string)) : []
         const directory = join(ctx.baseDir, config.storage.localDirectory)
+        const purgedFilenames: string[] = []
         let deleted = 0
         for (const manifest of manifests as string[]) {
+          // Always derive filename from manifest name so DB purge happens even
+          // when the manifest/asset files are already gone.
+          const derivedFilename = manifest.replace(/\.json$/, '')
+          purgedFilenames.push(derivedFilename)
           try {
             const manifestData = JSON.parse(await readFile(join(directory, manifest), 'utf8'))
-            const asset = typeof manifestData.filename === 'string' ? join(directory, manifestData.filename) : ''
-            if (asset) { try { await unlink(asset); deleted++ } catch {} }
-            await unlink(join(directory, manifest)); deleted++
-          } catch {}
+            const asset = typeof manifestData.filename === 'string' ? join(directory, manifestData.filename) : join(directory, derivedFilename)
+            try { await unlink(asset); deleted++ } catch {}
+            try { await unlink(join(directory, manifest)); deleted++ } catch {}
+          } catch {
+            try { await unlink(join(directory, derivedFilename)); deleted++ } catch {}
+            try { await unlink(join(directory, manifest)); deleted++ } catch {}
+          }
+        }
+        let purged = 0
+        let imageBedDeleted = 0
+        if (purgedFilenames.length) {
+          try { purged = await purgeAssetsByFilename(ctx, purgedFilenames) } catch {}
+          if (config.publicAccess?.mode === 'image-bed') {
+            const results = await Promise.all(purgedFilenames.map((fn) =>
+              deleteFromImageBed(fn, config.publicAccess as any, config.search.pageTimeoutMs).catch((error) => ({ ok: false, error: String(error?.message ?? error) }))
+            ))
+            imageBedDeleted = results.filter((r) => r.ok).length
+            const failures = results.filter((r) => !r.ok)
+            if (failures.length) ctx.logger(name).warn('%d image bed delete(s) failed: %s', failures.length, failures.map((f) => f.error).join('; ').slice(0, 200))
+          }
         }
         koa.set('Content-Type', 'application/json; charset=utf-8')
-        koa.body = JSON.stringify({ ok: true, deleted, requested: manifests.length })
+        koa.body = JSON.stringify({ ok: true, deleted, purged, imageBedDeleted, requested: manifests.length })
       })
-      ctx2.server.get(`${config.storage.localPublicPath}/_diagnostics/google-vision`, async (koa) => {
-        configureProxyFromChatLuna(ctx2, config)
-        const result = await diagnoseGoogleVision(config)
+      ctx2.server.post?.(`${config.storage.localPublicPath}/_cache/archive`, async (koa) => {
+        const body = await readJsonBody(koa)
+        const manifests = Array.isArray(body?.manifests) ? body.manifests.filter((m: unknown) => typeof m === 'string' && /^[a-zA-Z0-9._-]+\.json$/.test(m as string)) : []
+        if (!manifests.length) {
+          koa.status = 400
+          koa.body = JSON.stringify({ ok: false, error: 'no manifests' })
+          return
+        }
+        const directory = join(ctx.baseDir, config.storage.localDirectory)
+        // archiver@8 is ESM-only with named class exports; dynamic import keeps CJS-host compatible.
+        const { ZipArchive } = await import('archiver') as any
+        const archive: any = new ZipArchive({ zlib: { level: 0 } })
+        const zipName = `chatluna-image-resolver-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`
+        koa.set('Content-Type', 'application/zip')
+        koa.set('Content-Disposition', `attachment; filename="${zipName}"`)
+        koa.body = archive
+
+        for (const manifest of manifests as string[]) {
+          const filename = manifest.replace(/\.json$/, '')
+          let buffer: Buffer | undefined
+          // 1) Try local FS first.
+          try {
+            buffer = await readFile(join(directory, filename))
+          } catch {}
+          // 2) Fall back to image-bed public URL (DB.url) if local file missing.
+          if (!buffer && (ctx as any).database) {
+            try {
+              const result = await searchAssets(ctx, '', { filename }, { page: 1, pageSize: 1 })
+              const asset = result.items?.[0]
+              const url = (asset as any)?.imageBedUrl || (asset as any)?.url || (asset as any)?.publicUrl
+              if (url && /^https?:\/\//i.test(url)) {
+                const response = await fetchWithTimeout(url, {}, config.search.pageTimeoutMs)
+                if (response.ok) buffer = Buffer.from(await response.arrayBuffer())
+              }
+            } catch (error) {
+              ctx.logger(name).warn('archive fetch failed for %s: %s', filename, formatError(error))
+            }
+          }
+          if (buffer) archive.append(buffer, { name: filename })
+        }
+        archive.finalize().catch((error: unknown) => ctx.logger(name).warn('archive finalize failed: %s', formatError(error)))
+      })
+      ctx2.server.get(`${config.storage.localPublicPath}/_cache/settings`, async (koa) => {
         koa.set('Content-Type', 'application/json; charset=utf-8')
-        koa.body = JSON.stringify(result)
+        koa.body = JSON.stringify({ kinds: getCacheKinds() })
       })
-      ctx2.server.post?.(`${config.storage.localPublicPath}/_diagnostics/google-vision`, async (koa) => {
-        configureProxyFromChatLuna(ctx2, config)
-        const result = await diagnoseGoogleVision(config)
+      ctx2.server.post?.(`${config.storage.localPublicPath}/_cache/settings`, async (koa) => {
+        const body = await readJsonBody(koa)
+        const patch = body?.kinds || {}
+        const next = await saveCacheKinds(join(ctx.baseDir, config.storage.localDirectory), patch)
+        koa.set('Content-Type', 'application/json; charset=utf-8')
+        koa.body = JSON.stringify({ kinds: next })
+      })
+      ctx2.server.get(`${config.storage.localPublicPath}/_serpapi/account`, async (koa) => {
+        const result = await checkSerpApiAccount(config.credentials.serpApiKey, config.search.pageTimeoutMs)
         koa.set('Content-Type', 'application/json; charset=utf-8')
         koa.body = JSON.stringify(result)
       })
@@ -1005,12 +1214,26 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
         }
       })
     })
+    // Hourly cold purge: drops assets that have not been touched for `coldThresholdDays`
+    // across local FS + image bed + DB. Skipped automatically when threshold is 0.
+    const runColdSweep = async () => {
+      const result = await runColdPurge(ctx, config)
+      if (result.eligible) {
+        ctx.logger(name).info('cold purge: eligible=%d db=%d imageBed=%d local=%d', result.eligible, result.purgedDb, result.purgedImageBed, result.purgedLocal)
+      }
+    }
     ctx.on('ready', () => {
       void runCacheMaintenance().catch((error) => ctx.logger(name).warn('media cache maintenance failed: %s', formatError(error)))
+      // Also fire cold purge once on startup so a crash/restart doesn't grant
+      // expired assets an extra hour of life waiting for the next tick.
+      void runColdSweep().catch((error) => ctx.logger(name).warn('cold purge failed: %s', formatError(error)))
     })
     ctx.setInterval?.(() => {
       void runCacheMaintenance().catch((error) => ctx.logger(name).warn('media cache maintenance failed: %s', formatError(error)))
     }, Math.max(1, config.storage.cleanupIntervalMinutes) * 60 * 1000)
+    ctx.setInterval?.(() => {
+      void runColdSweep().catch((error) => ctx.logger(name).warn('cold purge failed: %s', formatError(error)))
+    }, 60 * 60 * 1000)
   }
 
   const registerTool = (ctx2: Context) => {
@@ -1057,7 +1280,7 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
         meta: {
           source: 'extension',
           group: 'image-resolver',
-          tags: ['image-resolver', 'reverse-image-search', 'google-lens', config.reverse.provider],
+          tags: ['image-resolver', 'reverse-image-search', 'google-lens'],
           defaultAvailability: {
             enabled: true,
             main: true,
@@ -1140,14 +1363,10 @@ export function apply(ctx: Context, input: ConfigInput | Config) {
     )
 
   ctx.command('image-resolver.reverse <imageUrl:string>', '以图搜图并返回来源线索')
-    .option('provider', '-p <provider:string> 指定 auto、serpapi、serpapi-lens 或 google')
     .option('maxResults', '-m <maxResults:number> 最大返回结果数')
     .action(async ({ options }, imageUrl) => {
       if (!imageUrl?.trim()) return '请输入图片 URL。'
-      const provider = options?.provider === 'auto' || options?.provider === 'google' || options?.provider === 'serpapi-lens'
-        ? options.provider
-        : undefined
       const resolver = new ReverseImageResolver(ctx, config)
-      return JSON.stringify(await resolver.resolve(imageUrl, provider, Number(options?.maxResults) || undefined), null, 2)
+      return JSON.stringify(await resolver.resolve(imageUrl, Number(options?.maxResults) || undefined), null, 2)
     })
 }

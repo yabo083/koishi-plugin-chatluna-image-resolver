@@ -2,13 +2,10 @@ import { extname } from 'node:path'
 import { createRequire } from 'node:module'
 import type {
   Config,
-  GoogleReverseResult,
   ImageCandidate,
   SerpApiLensResult,
-  SerpApiReverseResult,
   TrackedMedia,
-  TrackedMediaKind,
-  WebDetection
+  TrackedMediaKind
 } from './types'
 
 const nodeRequire = createRequire(__filename)
@@ -44,66 +41,16 @@ export function serpApiImagesToCandidates(payload: any): ImageCandidate[] {
     const sourcePage = bestSourcePage(item)
     const width = numberOrUndefined(item?.original_width ?? item?.width)
     const height = numberOrUndefined(item?.original_height ?? item?.height)
+    const title = typeof item?.title === 'string' ? item.title : undefined
     if (typeof item?.original === 'string') {
-      pushCandidate(candidates, item.original, sourcePage, 'serpapi-original', width, height)
+      pushCandidate(candidates, item.original, sourcePage, 'serpapi-original', width, height, title)
       continue
     }
     if (typeof item?.thumbnail === 'string') {
-      pushCandidate(candidates, item.thumbnail, sourcePage, 'serpapi-thumbnail', width, height)
+      pushCandidate(candidates, item.thumbnail, sourcePage, 'serpapi-thumbnail', width, height, title)
     }
   }
   return uniqueBy(candidates, (item) => normalizeImageUrl(item.url))
-}
-
-export function buildGoogleVisionWebDetectionRequest(buffer: Buffer, maxResults: number) {
-  return {
-    requests: [
-      {
-        image: {
-          content: buffer.toString('base64')
-        },
-        features: [
-          {
-            type: 'WEB_DETECTION',
-            maxResults: clamp(Math.floor(maxResults), 1, 50)
-          }
-        ]
-      }
-    ]
-  }
-}
-
-export function buildGoogleVisionWebDetectionUriRequest(imageUri: string, maxResults: number) {
-  return {
-    requests: [
-      {
-        image: {
-          source: {
-            imageUri
-          }
-        },
-        features: [
-          {
-            type: 'WEB_DETECTION',
-            maxResults: clamp(Math.floor(maxResults), 1, 50)
-          }
-        ]
-      }
-    ]
-  }
-}
-
-export function buildSerpApiReverseImageUrl(options: {
-  apiKey: string
-  imageUrl: string
-  googleDomain?: string
-}) {
-  const url = new URL('https://serpapi.com/search.json')
-  url.searchParams.set('engine', 'google_reverse_image')
-  url.searchParams.set('api_key', options.apiKey)
-  url.searchParams.set('image_url', options.imageUrl)
-  if (options.googleDomain?.trim()) url.searchParams.set('google_domain', options.googleDomain.trim())
-  return url.href
 }
 
 export function buildSerpApiGoogleLensUrl(options: {
@@ -119,23 +66,6 @@ export function buildSerpApiGoogleLensUrl(options: {
   if (options.hl?.trim()) url.searchParams.set('hl', options.hl.trim())
   if (options.type?.trim()) url.searchParams.set('type', options.type.trim())
   return url.href
-}
-
-export function serpApiReversePayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiReverseResult {
-  const raw = Array.isArray(payload?.image_results) ? payload.image_results : []
-  return {
-    provider: 'serpapi',
-    imageUrl,
-    searchInformation: payload?.search_information,
-    imageResults: raw.slice(0, maxResults).map((item: any) => ({
-      position: numberOrUndefined(item?.position),
-      title: typeof item?.title === 'string' ? item.title : '',
-      link: typeof item?.link === 'string' ? item.link : '',
-      source: typeof item?.source === 'string' ? item.source : '',
-      thumbnail: typeof item?.thumbnail === 'string' ? item.thumbnail : '',
-      original: typeof item?.original === 'string' ? item.original : ''
-    }))
-  }
 }
 
 export function serpApiLensPayloadToResult(imageUrl: string, payload: any, maxResults: number): SerpApiLensResult {
@@ -187,33 +117,9 @@ export function rewriteImageUrlForPublicAccess(imageUrl: string, privateBaseUrl:
   return `${publicBase}${imageUrl.slice(privateBase.length)}`
 }
 
-export function normalizeWebDetection(web: WebDetection, maxResults: number): WebDetection {
-  return {
-    webEntities: (web.webEntities ?? []).slice(0, maxResults).map((item) => ({
-      score: item.score,
-      description: item.description
-    })),
-    fullMatchingImages: [],
-    partialMatchingImages: [],
-    pagesWithMatchingImages: (web.pagesWithMatchingImages ?? [])
-      .filter((item) => item.url)
-      .slice(0, maxResults)
-      .map((item) => ({
-        url: item.url,
-        pageTitle: item.pageTitle || ''
-      })),
-    visuallySimilarImages: [],
-    bestGuessLabels: (web.bestGuessLabels ?? []).slice(0, maxResults)
-  }
-}
-
-export function attachReverseNote<T extends GoogleReverseResult | SerpApiReverseResult | SerpApiLensResult>(result: T, config: Config): T & { ok: true; note: string } {
+export function attachReverseNote<T extends SerpApiLensResult>(result: T, config: Config): T & { ok: true; note: string } {
   const notes = [
-    result.provider === 'google'
-      ? 'Google provider used downloaded image bytes encoded as base64, so ChatLuna cached/local image URLs are acceptable if Koishi can fetch them.'
-      : result.provider === 'serpapi-lens'
-        ? 'SerpApi Google Lens provider used engine=google_lens with url. This is recommended for QQ/NapCat Tencent CDN image URLs when Google Reverse Image returns empty results.'
-        : 'SerpApi provider used Google Reverse Image with image_url, so imageUrl must be publicly reachable by SerpApi/Google.'
+    'SerpApi Google Lens provider used engine=google_lens with url.'
   ]
   if (config.reverse.customPrompt.trim()) notes.push(config.reverse.customPrompt.trim())
   return {
@@ -223,10 +129,10 @@ export function attachReverseNote<T extends GoogleReverseResult | SerpApiReverse
   }
 }
 
-export function pushCandidate(out: ImageCandidate[], value: string, pageUrl: string, reason: string, width?: number, height?: number) {
+export function pushCandidate(out: ImageCandidate[], value: string, pageUrl: string, reason: string, width?: number, height?: number, title?: string) {
   const url = absolutizeUrl(value, pageUrl)
   if (!url || !/^https?:\/\//i.test(url)) return
-  out.push({ url, sourcePage: pageUrl, score: 0, width, height, reason })
+  out.push({ url, sourcePage: pageUrl, score: 0, title, width, height, reason })
 }
 
 export function candidatesFromRawImage(raw: any, pageUrl: string): ImageCandidate[] {
@@ -269,14 +175,12 @@ export function scoreCandidate(candidate: ImageCandidate, config: Config, safeMo
   return { ...candidate, url, score }
 }
 
-export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, options?: { noProxy?: boolean }) {
-  if (!options?.noProxy) configureFetchProxy()
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+  configureFetchProxy()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const fetchOptions: any = { ...init, signal: controller.signal }
-    if (options?.noProxy) fetchOptions.dispatcher = undefined
-    return await fetch(url, fetchOptions)
+    return await fetch(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timer)
   }
@@ -534,4 +438,70 @@ function isPrivateIPv4(host: string) {
 export function numberOrUndefined(value: unknown) {
   const number = Number(value)
   return Number.isFinite(number) && number > 0 ? number : undefined
+}
+
+export function computeOrientation(width?: number, height?: number): 'landscape' | 'portrait' | 'square' | undefined {
+  if (!width || !height || width <= 0 || height <= 0) return undefined
+  if (width > height) return 'landscape'
+  if (width < height) return 'portrait'
+  return 'square'
+}
+
+export function computeAspectRatio(width?: number, height?: number): number | undefined {
+  if (!width || !height || height <= 0) return undefined
+  return Math.round((width / height) * 100) / 100
+}
+
+export function detectIsAnimated(mime: string, filename: string): boolean {
+  const m = mime.toLowerCase()
+  if (m === 'image/gif') return true
+  if (m === 'image/apng') return true
+  if (/\.apng$/i.test(filename)) return true
+  return false
+}
+
+export function generateBatchId(query: string, timestamp: number): string {
+  const { createHash } = require('node:crypto')
+  const hash = createHash('sha1').update(`${query}\n${timestamp}`).digest('hex').slice(0, 10)
+  return `batch-${hash}`
+}
+
+export function extractPageTitle(item: any): string | undefined {
+  if (!item || typeof item !== 'object') return undefined
+  const title = item.title
+  return typeof title === 'string' && title.trim() ? title.trim() : undefined
+}
+
+export function extractTagsFromQuery(query: string): string[] {
+  if (!query || !query.trim()) return []
+  return query.trim().split(/\s+/).filter(Boolean)
+}
+
+export interface SerpApiAccountResult {
+  ok: boolean
+  plan?: string
+  totalSearchesLeft?: number
+  searchesPerMonth?: number
+  error?: string
+}
+
+export async function checkSerpApiAccount(apiKey: string, timeoutMs = 10000): Promise<SerpApiAccountResult> {
+  if (!apiKey || !apiKey.trim()) return { ok: false, error: 'not_configured' }
+  try {
+    const response = await fetchWithTimeout(
+      `https://serpapi.com/account?api_key=${encodeURIComponent(apiKey.trim())}`,
+      { headers: { 'Accept': 'application/json' } },
+      timeoutMs
+    )
+    const data: any = await response.json()
+    if (data.error) return { ok: false, error: String(data.error).toLowerCase().includes('invalid') ? 'invalid_key' : String(data.error) }
+    return {
+      ok: true,
+      plan: data.plan_name || data.plan,
+      totalSearchesLeft: data.total_searches_left,
+      searchesPerMonth: data.searches_per_month,
+    }
+  } catch (error) {
+    return { ok: false, error: formatError(error) }
+  }
 }

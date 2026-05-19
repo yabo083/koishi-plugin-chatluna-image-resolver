@@ -4,6 +4,8 @@ const test = require('node:test')
 const {
   Config,
   buildSerpApiImagesUrl,
+  checkSerpApiAccount,
+  resolveCacheOnResolve,
   normalizeConfig,
   rewriteUrlBase,
   serpApiImagesToCandidates
@@ -13,18 +15,19 @@ test('public config exposes only dedicated API search providers', () => {
   const json = JSON.stringify(Config.toJSON())
 
   assert.match(json, /SerpApi Google Images/)
-  assert.doesNotMatch(json, /DuckDuckGo|Tavily|网页解析|Puppeteer 读取 DOM|serpapi-fallback/)
+  assert.match(json, /SerpApi Google Lens/)
+  assert.doesNotMatch(json, /DuckDuckGo|Tavily|网页解析|Puppeteer 读取 DOM|serpapi-fallback|Google Vision|google_reverse_image|自动：使用 SerpApi|以图搜图提供方/)
 })
 
 test('public config is grouped into feature domains instead of flat sections', () => {
   const json = JSON.stringify(Config.toJSON())
 
-  for (const label of ['API 凭据', '功能开关', '以文搜图', '以图搜图', 'QQ 多媒体解析', '存储与分发', '调试']) {
+  for (const label of ['API 凭据', '功能开关', '以文搜图', '以图搜图', '媒体解析', '缓存管理', '调试日志']) {
     assert.match(json, new RegExp(label))
   }
   assert.match(json, /SerpApi API Key/)
   assert.match(json, /统一保留时间/)
-  assert.match(json, /HTTP 请求/)
+  assert.match(json, /网络请求/)
   assert.match(json, /调试日志/)
   assert.doesNotMatch(json, /API 配置|缓存策略|服务商配置|下载限值|网络与代理/)
   assert.doesNotMatch(json, /"description":"以文搜图 API"/)
@@ -54,11 +57,6 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
       }
     },
     reverseSearch: {
-      provider: {
-        provider: 'google',
-        serpApiKey: 'serp-reverse',
-        googleApiKey: 'google-key'
-      },
       behavior: {
         maxResults: 12,
         publicBaseUrl: 'https://public.example.test',
@@ -75,7 +73,6 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
         localFallback: true,
         localDirectory: 'cache-dir',
         localPublicPath: '/media-cache',
-        expiredRetentionMinutes: 5,
         cleanupIntervalMinutes: 5
       },
       delivery: { publicBaseUrl: 'https://bot.example.test' }
@@ -98,8 +95,6 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
   assert.equal(nested.search.serpApiKey, 'serp-text')
   assert.equal(nested.image.tempExpireHours, 72)
   assert.equal(nested.storage.retentionDays, 3)
-  assert.equal(nested.storage.expiredRetentionDays, 5 / 1440)
-  assert.equal(nested.storage.expiredRetentionMinutes, 5)
   assert.equal(nested.storage.cleanupIntervalMinutes, 5)
   assert.equal(nested.storage.localPublicPath, '/media-cache')
   assert.equal(nested.delivery.publicBaseUrl, 'https://bot.example.test')
@@ -137,16 +132,13 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
       qqMediaEnabled: false
     },
     credentials: {
-      serpApiKey: 'flat-serp',
-      googleClientEmail: 'svc@example.test',
-      googlePrivateKey: '-----BEGIN PRIVATE KEY-----\\nkey\\n-----END PRIVATE KEY-----\\n'
+      serpApiKey: 'flat-serp'
     },
     textSearch: {
       maxCount: 5,
       minWidth: 360
     },
     reverseSearch: {
-      provider: 'google',
       maxResults: 8,
       publicBaseUrl: 'https://flat-public.example.test'
     },
@@ -180,15 +172,16 @@ test('normalizes nested config and legacy config into one runtime shape', () => 
   assert.equal(flat.search.serpApiKey, 'flat-serp')
   assert.equal(flat.image.maxCount, 5)
   assert.equal(flat.image.minWidth, 360)
-  assert.equal(flat.reverse.provider, 'google')
   assert.equal(flat.credentials.serpApiKey, 'flat-serp')
-  assert.equal(flat.credentials.googleClientEmail, 'svc@example.test')
-  assert.equal(flat.reverse.googleServiceAccountJson.includes('svc@example.test'), true)
   assert.equal(flat.reverse.maxResults, 8)
   assert.equal(flat.storage.localPublicPath, '/flat-cache')
   assert.equal(flat.delivery.publicBaseUrl, 'https://flat-bot.example.test')
-  assert.equal(flat.webdav.enabled, true)
+  assert.equal(flat.webdav.enabled, false)
   assert.equal(flat.webdav.endpoint, 'https://dav.example.test')
+  // Legacy storage.webdav auto-migrates to publicAccess image-bed webdav
+  assert.equal(flat.publicAccess.mode, 'image-bed')
+  assert.equal(flat.publicAccess.imageBedProvider, 'webdav')
+  assert.equal(flat.publicAccess.webdavEndpoint, 'https://dav.example.test')
   assert.equal(flat.search.pageTimeoutMs, 6000)
   assert.equal(flat.image.maxDownloadBytes, 1500000)
   assert.equal(flat.qqMedia.maxDownloadBytes, 2500000)
@@ -243,6 +236,7 @@ test('maps SerpApi image results to direct image candidates first', () => {
     url: 'https://cdn.example.test/full.jpg',
     sourcePage: 'https://example.test/page',
     score: 0,
+    title: 'first',
     width: 1200,
     height: 900,
     reason: 'serpapi-original'
@@ -273,4 +267,136 @@ test('rewrites stored image URLs for onebot docker-accessible delivery', () => {
     rewriteUrlBase('https://example.com/image.png', ''),
     'https://example.com/image.png'
   )
+})
+
+test('qq media cache decision respects the runtime default unless overridden', () => {
+  assert.equal(resolveCacheOnResolve(undefined, false), false)
+  assert.equal(resolveCacheOnResolve(undefined, true), true)
+  assert.equal(resolveCacheOnResolve(true, false), true)
+  assert.equal(resolveCacheOnResolve(false, true), false)
+})
+
+test('storage schema no longer exposes legacy webdav fields', () => {
+  const json = JSON.stringify(Config.toJSON())
+  // Old-only field names must not appear anywhere in the schema
+  assert.doesNotMatch(json, /"webdavEnabled"/, 'schema should not contain webdavEnabled')
+  assert.doesNotMatch(json, /"webdavPublicBaseUrl"/, 'schema should not contain webdavPublicBaseUrl')
+  // The storage group description must not mention WebDAV deprecated fields
+  assert.doesNotMatch(json, /已弃用/, 'no deprecated descriptions should remain')
+  // WebDAV config still exists under publicAccess → image-bed
+  assert.match(json, /公网访问/)
+  assert.match(json, /图床托管/)
+  assert.match(json, /"webdavEndpoint"/)
+  assert.match(json, /WebDAV 根地址/)
+})
+
+test('normalizeConfig migrates legacy storage.webdav to publicAccess image-bed', () => {
+  const result = normalizeConfig({
+    storage: {
+      webdavEnabled: true,
+      webdavEndpoint: 'https://dav.migrate.test',
+      webdavUsername: 'user1',
+      webdavPassword: 'pass1',
+      webdavBasePath: 'images',
+      webdavPublicBaseUrl: 'https://cdn.migrate.test/images'
+    }
+  })
+
+  assert.equal(result.publicAccess.mode, 'image-bed')
+  assert.equal(result.publicAccess.imageBedProvider, 'webdav')
+  assert.equal(result.publicAccess.webdavEndpoint, 'https://dav.migrate.test')
+  assert.equal(result.publicAccess.webdavUsername, 'user1')
+  assert.equal(result.publicAccess.webdavPassword, 'pass1')
+  assert.equal(result.publicAccess.webdavBasePath, 'images')
+  assert.equal(result.publicAccess.webdavPublicUrl, 'https://cdn.migrate.test/images')
+})
+
+test('normalizeConfig does not override explicit publicAccess with legacy webdav', () => {
+  const result = normalizeConfig({
+    storage: {
+      webdavEnabled: true,
+      webdavEndpoint: 'https://dav.old.test'
+    },
+    publicAccess: {
+      mode: 'self-hosted',
+      publicBaseUrl: 'https://my-server.test'
+    }
+  })
+
+  assert.equal(result.publicAccess.mode, 'self-hosted')
+  assert.equal(result.publicAccess.publicBaseUrl, 'https://my-server.test')
+  assert.notEqual(result.publicAccess.imageBedProvider, 'webdav')
+})
+
+test('normalizeConfig always sets webdav.enabled to false', () => {
+  const withEnabled = normalizeConfig({
+    storage: { webdavEnabled: true, webdavEndpoint: 'https://dav.test' }
+  })
+  assert.equal(withEnabled.webdav.enabled, false)
+
+  const withoutEnabled = normalizeConfig({})
+  assert.equal(withoutEnabled.webdav.enabled, false)
+
+  const directWebdav = normalizeConfig({
+    webdav: { enabled: true, endpoint: 'https://direct.test' }
+  })
+  assert.equal(directWebdav.webdav.enabled, false)
+})
+
+test('publicAccess schema exposes 3 flat selectable modes for Koishi console', () => {
+  const json = JSON.stringify(Config.toJSON())
+  assert.match(json, /"value":"self-hosted"/, 'self-hosted mode const')
+  assert.match(json, /"value":"image-bed-s3"/, 'image-bed-s3 mode const')
+  assert.match(json, /"value":"image-bed-webdav"/, 'image-bed-webdav mode const')
+  assert.doesNotMatch(json, /"value":"image-bed"[^-]/, 'no bare image-bed const')
+  assert.match(json, /S3 端点/)
+  assert.match(json, /WebDAV 根地址/)
+})
+
+test('normalizeConfig maps image-bed-s3 to internal mode image-bed + provider s3', () => {
+  const result = normalizeConfig({
+    publicAccess: {
+      mode: 'image-bed-s3',
+      s3Endpoint: 'https://s3.test',
+      s3Bucket: 'bucket1',
+      s3AccessKeyId: 'ak',
+      s3SecretAccessKey: 'sk',
+      s3PublicUrl: 'https://cdn.test'
+    }
+  })
+  assert.equal(result.publicAccess.mode, 'image-bed')
+  assert.equal(result.publicAccess.imageBedProvider, 's3')
+  assert.equal(result.publicAccess.s3Endpoint, 'https://s3.test')
+  assert.equal(result.publicAccess.s3Bucket, 'bucket1')
+  assert.equal(result.publicAccess.s3PublicUrl, 'https://cdn.test')
+})
+
+test('normalizeConfig maps image-bed-webdav to internal mode image-bed + provider webdav', () => {
+  const result = normalizeConfig({
+    publicAccess: {
+      mode: 'image-bed-webdav',
+      webdavEndpoint: 'https://dav.test',
+      webdavUsername: 'u',
+      webdavPassword: 'p',
+      webdavBasePath: 'img',
+      webdavPublicUrl: 'https://cdn.dav.test/img'
+    }
+  })
+  assert.equal(result.publicAccess.mode, 'image-bed')
+  assert.equal(result.publicAccess.imageBedProvider, 'webdav')
+  assert.equal(result.publicAccess.webdavEndpoint, 'https://dav.test')
+  assert.equal(result.publicAccess.webdavUsername, 'u')
+  assert.equal(result.publicAccess.webdavPublicUrl, 'https://cdn.dav.test/img')
+})
+
+test('checkSerpApiAccount returns not_configured when key is empty', async () => {
+  const result = await checkSerpApiAccount('')
+  assert.equal(result.ok, false)
+  assert.equal(result.error, 'not_configured')
+})
+
+test('checkSerpApiAccount returns invalid_key for bad key', async () => {
+  const result = await checkSerpApiAccount('definitely_not_a_real_key_xyz')
+  assert.equal(result.ok, false)
+  assert.match(result.error, /invalid/i)
 })
